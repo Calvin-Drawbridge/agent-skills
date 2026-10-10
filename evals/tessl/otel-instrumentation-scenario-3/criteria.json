@@ -13,8 +13,8 @@
       "max_score": 10
     },
     {
-      "name": "AlwaysOn sampler preserved",
-      "description": "Does NOT set OTEL_TRACES_SAMPLER to 'traceidratio', 'parentbased_traceidratio', or any other sampler that drops spans — relies on default AlwaysOn",
+      "name": "Parent-based default sampler preserved",
+      "description": "Uses the default ParentBased(root=AlwaysOn) or explicitly configures parentbased_always_on, sampling new roots while honoring parent decisions; does not introduce traceidratio, parentbased_traceidratio, or always_on overrides",
       "max_score": 10
     },
     {

@@ -104,14 +104,14 @@ If it doesn't serve one of these purposes, don't emit it.
 
 ### Sample in the pipeline, not the SDK
 
-Use the `AlwaysOn` sampler (the default) in every SDK.
-Do not configure SDK-side samplers — they make irreversible decisions before the outcome of a request is known.
-Defer all sampling to the [Collector](../otel-collector/rules/sampling.md), where policies can be changed centrally without redeploying applications.
+Use the default `ParentBased(root=AlwaysOn)` sampler: sample new root traces and respect an existing parent’s sampling decision.
+Do not introduce ratio-based SDK sampling for new roots, or replace the parent-based default with `AlwaysOn`.
+Keep additional sampling policies in the [Collector](../otel-collector/rules/sampling.md), where they can be changed centrally without redeploying applications.
 
 <!-- eval:skip -->
 ```
-SDK (AlwaysOn)  →  Collector (sampling)  →  Backend (retention)
-     ↓                    ↓                       ↓
-  All spans         Head or tail            Storage policies
-  exported          sampling applied
+SDK (ParentBased, root=AlwaysOn) → Collector (sampling) → Backend (retention)
+              ↓                           ↓                      ↓
+  New roots sampled; existing        Head or tail          Storage policies
+  parent decisions respected         sampling applied
 ```

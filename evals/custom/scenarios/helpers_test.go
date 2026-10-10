@@ -30,8 +30,9 @@ type spanSpec struct {
 	attrs map[string]string
 	// traceID and spanID are optional raw ids (16 and 8 bytes); the stdout
 	// correlation tests set them to control the exported pairs.
-	traceID []byte
-	spanID  []byte
+	traceID      []byte
+	spanID       []byte
+	parentSpanID []byte
 }
 
 func resourceWith(testID string, attrs map[string]string) *resourcepb.Resource {
@@ -46,11 +47,12 @@ func feedSpans(t *testing.T, sink *otelsink.Sink, resourceAttrs map[string]strin
 	var pbSpans []*tracepb.Span
 	for _, s := range spans {
 		pbSpans = append(pbSpans, &tracepb.Span{
-			Name:       s.name,
-			Kind:       s.kind,
-			Attributes: strAttrs(s.attrs),
-			TraceId:    s.traceID,
-			SpanId:     s.spanID,
+			Name:         s.name,
+			Kind:         s.kind,
+			Attributes:   strAttrs(s.attrs),
+			TraceId:      s.traceID,
+			SpanId:       s.spanID,
+			ParentSpanId: s.parentSpanID,
 		})
 	}
 	req := &coltracepb.ExportTraceServiceRequest{

@@ -23,6 +23,56 @@ var (
 	httpPathAttributes   = []string{"url.path", "http.route", "http.target", "url.full", "http.url"}
 )
 
+// Synthetic W3C IDs shared by the Node.js traffic driver and assertions.
+// Keep these distinct from skill examples: the agent's validation traffic
+// can reach the same sink before the harness runs the final fixture.
+const (
+	sampledTraceID       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sampledParentID      = "bbbbbbbbbbbbbbbb"
+	unsampledTraceID     = "cccccccccccccccccccccccccccccccc"
+	sampledTraceparent   = "00-" + sampledTraceID + "-" + sampledParentID + "-01"
+	unsampledTraceparent = "00-" + unsampledTraceID + "-dddddddddddddddd-00"
+)
+
+// assertInboundParentHTTPTraces preserves the root-request check while also
+// requiring the exact sampled remote parent and rejecting any exported spans
+// in the unsampled trace. The Node.js driver sends root requests last.
+func assertInboundParentHTTPTraces(serviceName string) harness.Assertion {
+	return func(t *testing.T, sink *otelsink.Sink) error {
+		if err := assertHTTPTraces(serviceName)(t, sink); err != nil {
+			return err
+		}
+		var root, remote bool
+		for _, sv := range sink.Traces(t).WithResourceAttribute("service.name", serviceName).Spans() {
+			span := sv.Span
+			traceID := fmt.Sprintf("%x", span.GetTraceId())
+			if traceID == unsampledTraceID {
+				return fmt.Errorf("span %q exported for an unsampled remote parent", span.GetName())
+			}
+			if span.GetKind() != tracepb.Span_SPAN_KIND_SERVER ||
+				attrValue(span.GetAttributes(), httpMethodAttributes...) != "GET" ||
+				!spanReferencesPath(span, "/checkout") {
+				continue
+			}
+			if traceID == sampledTraceID {
+				if parent := fmt.Sprintf("%x", span.GetParentSpanId()); parent != sampledParentID {
+					return fmt.Errorf("SERVER span in sampled trace has parent %q, want %q", parent, sampledParentID)
+				}
+				remote = true
+			} else if len(span.GetTraceId()) == 16 && len(span.GetParentSpanId()) == 0 {
+				root = true
+			}
+		}
+		if !root {
+			return fmt.Errorf("no root SERVER span for GET /checkout without incoming context")
+		}
+		if !remote {
+			return fmt.Errorf("no SERVER span for GET /checkout continuing the sampled remote parent")
+		}
+		return nil
+	}
+}
+
 // assertHTTPTraces builds the assertion shared by the HTTP instrumentation
 // scenarios: under the given service.name (AE4), a server span for
 // GET /checkout and a client span for the outbound call must be present.

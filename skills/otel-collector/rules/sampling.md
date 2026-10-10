@@ -14,8 +14,9 @@ tags:
 Sampling reduces the volume of trace data by selectively retaining only a subset of traces.
 It is an unavoidable necessity in large distributed systems, but every sampling strategy involves trade-offs.
 
-Application SDKs should use the `AlwaysOn` sampler (the default) and export every span.
-All sampling decisions belong in the Collector or observability pipeline, where they can be changed centrally without redeploying applications.
+Application SDKs should use the default `ParentBased(root=AlwaysOn)` sampler: sample new roots and respect existing parent sampling decisions.
+Keep additional sampling policies in the Collector or observability pipeline, where they can be changed centrally without redeploying applications.
+The Collector cannot recover spans already dropped by upstream sampling.
 See [SDK sampling guidance](../../otel-instrumentation/rules/spans.md#sampling) for why.
 
 ## Decision table
@@ -252,14 +253,15 @@ Tail sampling adds significant operational complexity:
 
 Accurate RED metrics cannot be computed from sampled traces — head sampling skews counts, tail sampling overrepresents errors.
 Always generate metrics from all spans before any sampling occurs.
+If upstream SDK sampling has already dropped spans, use unsampled application metrics for complete request counts; moving metric generation before Collector sampling cannot restore those spans.
 
 See [RED metrics from traces](./red-metrics.md) for connector configuration, histogram type selection, and a full configuration example combining RED metric materialization with tail sampling.
 
 ## Anti-patterns
 
-- **Sampling in the SDK.**
-  Configuring `TraceIdRatioBased` or other non-`AlwaysOn` samplers in the application loses traces before their outcome is known.
-  Use `AlwaysOn` in all SDKs and sample in the Collector.
+- **Introducing root sampling in the SDK.**
+  Configuring `TraceIdRatioBased` for new roots loses traces before their outcome is known.
+  Keep `ParentBased(root=AlwaysOn)` in SDKs, honor upstream sampling decisions, and apply additional policies in the Collector.
 - **Tail sampling without RED metric materialization.**
   Dashboards and alerts that depend on trace-derived metrics show skewed data.
   Always generate metrics from spans before the sampling step — see [RED metrics from traces](./red-metrics.md).

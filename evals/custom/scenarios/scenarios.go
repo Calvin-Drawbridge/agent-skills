@@ -149,6 +149,6 @@ Instrumentation goals:
 ` + promptCommonRequirements,
 		Timeout:          scenarioTimeout,
 		TelemetryTimeout: telemetryTimeout,
-		Assert:           assertHTTPTraces(NodeServiceName),
+		Assert:           assertInboundParentHTTPTraces(NodeServiceName),
 	}
 }

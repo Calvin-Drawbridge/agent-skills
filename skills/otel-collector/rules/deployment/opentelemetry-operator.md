@@ -278,7 +278,7 @@ spec:
     - tracecontext
     - baggage
   sampler:
-    type: always_on
+    type: parentbased_always_on
   resource:
     attributes:
       - name: deployment.environment.name

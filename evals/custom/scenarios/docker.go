@@ -105,6 +105,17 @@ func (d *DockerFixture) Hooks() harness.FixtureHooks {
 	return harness.FixtureHooks{Build: d.build, Run: d.run, AppOutput: d.appOutput}
 }
 
+// ParentTrafficHooks adds parent-context traffic for the Node.js scenario.
+// Send the unsampled request first and roots last so a root span's arrival
+// cannot satisfy the assertion before the parent-context requests run.
+func (d *DockerFixture) ParentTrafficHooks() harness.FixtureHooks {
+	hooks := d.Hooks()
+	hooks.Run = func(ctx context.Context, workspace string, env map[string]string) error {
+		return d.runWithParents(ctx, workspace, env, []string{unsampledTraceparent, sampledTraceparent})
+	}
+	return hooks
+}
+
 // appOutput returns the current fixture container's captured stdout/stderr.
 // The runner calls it on every assertion poll of an AssertApp scenario, so
 // it re-reads the container logs each time.
@@ -315,7 +326,11 @@ func (d *DockerFixture) buildContainerTopology(ctx context.Context, image string
 // run starts the container topology for one attempt and drives traffic at the
 // fixture. The containers keep running when it returns, so telemetry flushed
 // by batch processors still reaches the sink while the runner waits.
-func (d *DockerFixture) run(ctx context.Context, _ string, env map[string]string) error {
+func (d *DockerFixture) run(ctx context.Context, workspace string, env map[string]string) error {
+	return d.runWithParents(ctx, workspace, env, nil)
+}
+
+func (d *DockerFixture) runWithParents(ctx context.Context, _ string, env map[string]string, parents []string) error {
 	d.mu.Lock()
 	image := d.currentImage
 	d.mu.Unlock()
@@ -337,6 +352,13 @@ func (d *DockerFixture) run(ctx context.Context, _ string, env map[string]string
 	// Traffic driver: a helper container on the internal network probes
 	// GET /checkout, retrying while the fixture starts up.
 	checkoutURL := fmt.Sprintf("http://%s:%s/checkout", appAlias, appPort)
+	for _, parent := range parents {
+		if out, err := docker(ctx, "run", "--rm", "--network", topo.network,
+			"-e", "PROBE_TRACEPARENT="+parent, helperImage, "probe", checkoutURL, "1"); err != nil {
+			logs, _ := docker(context.Background(), "logs", topo.appName)
+			return fmt.Errorf("parent-context traffic driver failed against %s: %w\n%s\nfixture logs:\n%s", checkoutURL, err, out, logs)
+		}
+	}
 	if out, err := docker(ctx, "run", "--rm", "--network", topo.network,
 		helperImage, "probe", checkoutURL, trafficRequests); err != nil {
 		logs, _ := docker(context.Background(), "logs", topo.appName)

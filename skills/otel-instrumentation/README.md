@@ -121,7 +121,7 @@ init({
 ## Key Principles
 
 - **Signal density over volume** - Every telemetry item should help detect, localize, or explain issues
-- **Push reduction early** - SDK sampling → Collector filtering → Backend retention
+- **Respect parent sampling** - SDK `ParentBased(root=AlwaysOn)` → Collector sampling and filtering → Backend retention.
 - **SLO-aware policies** - Never sample data feeding your SLOs
 
 ## Resources

@@ -38,8 +38,8 @@
       "max_score": 8
     },
     {
-      "name": "AlwaysOn sampler recommendation",
-      "description": "The configuration or accompanying notes.md recommend (or assumes) that application SDKs use AlwaysOn sampling and that sampling only happens in the Collector",
+      "name": "Parent-based default sampler recommendation",
+      "description": "The configuration or accompanying notes.md recommend ParentBased(root=AlwaysOn) (parentbased_always_on) for SDKs, sampling new roots and honoring upstream decisions, with additional sampling in the Collector; does not recommend ratio-based root sampling or replacing ParentBased with AlwaysOn",
       "max_score": 6
     },
     {

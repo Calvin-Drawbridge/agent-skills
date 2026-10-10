@@ -78,12 +78,30 @@ If logs lack trace context, the logging bridge or SDK configuration is incomplet
 
 | Check | Pass criteria |
 |-------|---------------|
-| Root span exists | Each inbound request produces exactly one `SERVER` span with no parent |
+| Inbound parent is correct | Each sampled inbound request produces exactly one `SERVER` span; with a valid W3C `traceparent` header and the `tracecontext` propagator enabled, its trace ID and parent span ID match that context; without an accepted parent, it is a root |
+| Parent sampling is respected | A request with an accepted unsampled parent exports no spans under the default `ParentBased(root=AlwaysOn)` sampler |
 | Span kind is correct | `SERVER` for inbound, `CLIENT` for outbound, `PRODUCER`/`CONSUMER` for messaging |
 | Error status is set | 5xx responses produce spans with status `ERROR` and a non-empty status message |
-| No orphan spans | Every child span's parent exists in the trace |
+| No orphan spans | Every child span’s parent exists in a complete trace; in a capture of one service, accepted remote parents may be outside the capture |
 
 See [spans](./spans.md) for detailed span hygiene rules.
+
+Exercise all 3 parent-context cases against a local endpoint that accepts W3C trace context:
+
+```bash
+# No incoming parent: expect a new SERVER root with the default sampler.
+curl http://localhost:8080/checkout
+
+# Sampled remote parent: expect this trace ID and parent span ID on the SERVER span.
+curl -H 'traceparent: 00-11111111111111111111111111111111-2222222222222222-01' http://localhost:8080/checkout
+
+# Unsampled remote parent: expect no exported spans for this request or its children.
+curl -H 'traceparent: 00-33333333333333333333333333333333-4444444444444444-00' http://localhost:8080/checkout
+```
+
+For integration tests, finish the spans and call the tracer provider’s `forceFlush()` before asserting that spans are absent.
+For the live requests above, wait beyond the configured batch export delay (`OTEL_BSP_SCHEDULE_DELAY`, default 5000 ms) and verify that the sampled trace `11111111111111111111111111111111` arrives through the same exporter before checking for the unsampled trace; use an in-memory integration test with `forceFlush()` for a deterministic absence check.
+Treat invalid incoming context or context rejected at a trust boundary as no accepted parent.
 
 ### Metrics
 
