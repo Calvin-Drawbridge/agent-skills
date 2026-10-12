@@ -27,27 +27,28 @@ var (
 // Keep these distinct from skill examples: the agent's validation traffic
 // can reach the same sink before the harness runs the final fixture.
 const (
-	sampledTraceID       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	sampledParentID      = "bbbbbbbbbbbbbbbb"
-	unsampledTraceID     = "cccccccccccccccccccccccccccccccc"
-	sampledTraceparent   = "00-" + sampledTraceID + "-" + sampledParentID + "-01"
-	unsampledTraceparent = "00-" + unsampledTraceID + "-dddddddddddddddd-00"
+	sampledTraceID     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sampledParentID    = "bbbbbbbbbbbbbbbb"
+	sampledTraceparent = "00-" + sampledTraceID + "-" + sampledParentID + "-01"
 )
 
 // assertInboundParentHTTPTraces preserves the root-request check while also
-// requiring the exact sampled remote parent and rejecting any exported spans
-// in the unsampled trace. The Node.js driver sends root requests last.
+// requiring the exact sampled remote parent. Both cases are independent of
+// whether the application uses AlwaysOn or ParentBased(root=AlwaysOn).
 func assertInboundParentHTTPTraces(serviceName string) harness.Assertion {
 	return func(t *testing.T, sink *otelsink.Sink) error {
 		if err := assertHTTPTraces(serviceName)(t, sink); err != nil {
 			return err
 		}
-		var root, remote bool
-		for _, sv := range sink.Traces(t).WithResourceAttribute("service.name", serviceName).Spans() {
+		var root bool
+		remoteServers := make(map[string]bool)
+		parents := make(map[string]string)
+		spans := sink.Traces(t).WithResourceAttribute("service.name", serviceName).Spans()
+		for _, sv := range spans {
 			span := sv.Span
 			traceID := fmt.Sprintf("%x", span.GetTraceId())
-			if traceID == unsampledTraceID {
-				return fmt.Errorf("span %q exported for an unsampled remote parent", span.GetName())
+			if traceID == sampledTraceID {
+				parents[fmt.Sprintf("%x", span.GetSpanId())] = fmt.Sprintf("%x", span.GetParentSpanId())
 			}
 			if span.GetKind() != tracepb.Span_SPAN_KIND_SERVER ||
 				attrValue(span.GetAttributes(), httpMethodAttributes...) != "GET" ||
@@ -58,7 +59,7 @@ func assertInboundParentHTTPTraces(serviceName string) harness.Assertion {
 				if parent := fmt.Sprintf("%x", span.GetParentSpanId()); parent != sampledParentID {
 					return fmt.Errorf("SERVER span in sampled trace has parent %q, want %q", parent, sampledParentID)
 				}
-				remote = true
+				remoteServers[fmt.Sprintf("%x", span.GetSpanId())] = true
 			} else if len(span.GetTraceId()) == 16 && len(span.GetParentSpanId()) == 0 {
 				root = true
 			}
@@ -66,10 +67,27 @@ func assertInboundParentHTTPTraces(serviceName string) harness.Assertion {
 		if !root {
 			return fmt.Errorf("no root SERVER span for GET /checkout without incoming context")
 		}
-		if !remote {
+		if len(remoteServers) == 0 {
 			return fmt.Errorf("no SERVER span for GET /checkout continuing the sampled remote parent")
 		}
-		return nil
+		// Instrumentation may wrap the outbound call in INTERNAL spans. Follow
+		// only same-service, same-trace parents; do not require a direct child.
+		for _, sv := range spans {
+			span := sv.Span
+			if span.GetKind() != tracepb.Span_SPAN_KIND_CLIENT ||
+				fmt.Sprintf("%x", span.GetTraceId()) != sampledTraceID ||
+				attrValue(span.GetAttributes(), httpMethodAttributes...) != "GET" {
+				continue
+			}
+			seen := make(map[string]bool)
+			for parent := fmt.Sprintf("%x", span.GetParentSpanId()); parent != "" && !seen[parent]; parent = parents[parent] {
+				if remoteServers[parent] {
+					return nil
+				}
+				seen[parent] = true
+			}
+		}
+		return fmt.Errorf("no outbound CLIENT span descending from the sampled SERVER span")
 	}
 }
 

@@ -79,28 +79,31 @@ If logs lack trace context, the logging bridge or SDK configuration is incomplet
 | Check | Pass criteria |
 |-------|---------------|
 | Inbound parent is correct | Each sampled inbound request produces exactly one `SERVER` span; with a valid W3C `traceparent` header and the `tracecontext` propagator enabled, its trace ID and parent span ID match that context; without an accepted parent, it is a root |
-| Parent sampling is respected | A request with an accepted unsampled parent exports no spans under the default `ParentBased(root=AlwaysOn)` sampler |
+| Configured sampling policy is preserved | With an explicitly configured `AlwaysOn` sampler, an accepted unsampled parent does not suppress this service’s spans; preserve the accepted trace ID and parent span ID |
 | Span kind is correct | `SERVER` for inbound, `CLIENT` for outbound, `PRODUCER`/`CONSUMER` for messaging |
 | Error status is set | 5xx responses produce spans with status `ERROR` and a non-empty status message |
-| No orphan spans | Every child span’s parent exists in a complete trace; in a capture of one service, accepted remote parents may be outside the capture |
+| No orphan spans | Every expected parent exists in the same trace; explicitly known, accepted remote parents may be outside the capture or never exported upstream, in both single-service and multi-service captures |
 
 See [spans](./spans.md) for detailed span hygiene rules.
 
-Exercise all 3 parent-context cases against a local endpoint that accepts W3C trace context:
+For an endpoint explicitly configured with `AlwaysOn` and accepting W3C trace context, exercise all 3 cases below.
+Keep parentage checks separate from sampling expectations; for another configured policy, derive the expected exports from that policy and the accepted context.
 
 ```bash
-# No incoming parent: expect a new SERVER root with the default sampler.
+# No incoming parent: expect a new SERVER root.
 curl http://localhost:8080/checkout
 
 # Sampled remote parent: expect this trace ID and parent span ID on the SERVER span.
 curl -H 'traceparent: 00-11111111111111111111111111111111-2222222222222222-01' http://localhost:8080/checkout
 
-# Unsampled remote parent: expect no exported spans for this request or its children.
+# Unsampled remote parent with AlwaysOn: expect exported spans with this trace ID.
+# The SERVER parent span ID must be 4444444444444444.
 curl -H 'traceparent: 00-33333333333333333333333333333333-4444444444444444-00' http://localhost:8080/checkout
 ```
 
-For integration tests, finish the spans and call the tracer provider’s `forceFlush()` before asserting that spans are absent.
-For the live requests above, wait beyond the configured batch export delay (`OTEL_BSP_SCHEDULE_DELAY`, default 5000 ms) and verify that the sampled trace `11111111111111111111111111111111` arrives through the same exporter before checking for the unsampled trace; use an in-memory integration test with `forceFlush()` for a deterministic absence check.
+For integration tests, finish the spans and call the tracer provider’s `forceFlush()` before checking the exported spans.
+For live requests, wait for batch export and verify that the expected spans arrive for each request.
+If spans are missing, inspect the configured sampler and exporter delivery; missing spans alone do not identify the sampler.
 Treat invalid incoming context or context rejected at a trust boundary as no accepted parent.
 
 ### Metrics

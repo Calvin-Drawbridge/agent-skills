@@ -1,5 +1,5 @@
 {
-  "context": "Regression coverage for JavaScript SDK 2.x compatibility, parent-based default sampling, and validation of local and remote span parents.",
+  "context": "Regression coverage for JavaScript SDK 2.x compatibility, preservation of an existing explicit AlwaysOn policy, and validation of local and remote span parents.",
   "type": "weighted_checklist",
   "checklist": [
     {
@@ -23,8 +23,8 @@
       "max_score": 10
     },
     {
-      "name": "Parent-based default sampling",
-      "description": "Uses the default ParentBased(root=AlwaysOn) sampler or its explicit equivalent; does not override parent decisions with AlwaysOn or introduce ratio-based root sampling",
+      "name": "Existing sampling policy preserved",
+      "description": "Both SDK setups retain the explicitly configured AlwaysOn sampler specified by the task, rather than falling back to the SDK default or introducing ratio-based sampling",
       "max_score": 10
     },
     {
@@ -34,7 +34,7 @@
     },
     {
       "name": "Unsampled-parent runtime test",
-      "description": "A real SDK test supplies an unsampled remote parent, creates the receiving SERVER span and an outbound CLIENT child in that context, finishes and flushes them, and asserts that neither is exported",
+      "description": "A real SDK test supplies an unsampled remote parent under the existing explicit AlwaysOn policy, finishes and flushes the SERVER span and an outbound CLIENT child, and asserts that both are exported with the incoming trace ID and correct parent relationships",
       "max_score": 10
     },
     {
@@ -44,7 +44,7 @@
     },
     {
       "name": "Missing and remote parent controls",
-      "description": "Tests detect a missing expected parent and accept an explicitly supplied remote parent outside the capture",
+      "description": "Tests detect a missing expected parent, reject a same-span-ID parent from another trace, and accept an explicitly supplied remote parent outside the capture or never exported upstream",
       "max_score": 10
     },
     {

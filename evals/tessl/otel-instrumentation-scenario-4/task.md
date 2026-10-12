@@ -10,13 +10,14 @@ The browser uses a `WebTracerProvider` and a batch export processor.
 Keep the processor order and use valid ESM imports in both setups.
 Use `https://telemetry.example.test/v1/traces` as the browser’s illustrative endpoint, and keep credentials out of the source.
 
-The service sits behind a trusted gateway that propagates W3C trace context.
+Both setups already use an explicitly configured `AlwaysOn` sampler; preserve that existing policy during the SDK upgrade.
+Callers’ W3C trace context reaches the service unchanged, with no ingress resetting it.
 Additional sampling is managed in the Collector.
 Validate requests with no incoming parent, a sampled remote parent, and an unsampled remote parent.
 Explain the expected trace shape and sampling behavior in the tests.
 
 Use an in-memory exporter to test span hygiene for outbound calls and missing parents, including positive and negative cases.
-Tests capturing only this service may receive an explicitly supplied remote parent context whose span is outside the capture.
+Tests may receive an explicitly supplied remote parent context whose span is outside the capture or was never exported upstream.
 Account for the scope of that capture in the tests.
 Use real SDK spans and flush the provider before inspecting finished spans.
 

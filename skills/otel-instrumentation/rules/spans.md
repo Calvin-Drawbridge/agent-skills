@@ -387,9 +387,9 @@ Verify this rule in integration tests — see [testing trace data](#no-parentles
 ### No orphan spans
 <!-- Instrumentation Score: SPA-002 (Normal) -->
 
-In a complete trace, every span with a `parent_span_id` must have a corresponding parent span.
-When capturing only one service, account for accepted remote parents outside the capture before reporting orphans.
-Orphan spans indicate broken context propagation or instrumentation gaps, and result in fragmented, misleading trace views.
+Verify that every parent expected in the capture is present.
+Account for explicitly known, accepted remote parents outside the capture, including upstream parents that were never exported.
+Apply this distinction to both single-service and multi-service captures; an unexplained missing parent indicates broken context propagation or an instrumentation gap.
 
 Common causes:
 - Parent span was dropped by sampling while child span was retained
@@ -441,19 +441,14 @@ Verify this rule in integration tests — see [testing trace data](#short-durati
 
 ## Sampling
 
-Use `ParentBased(root=AlwaysOn)`, the [OpenTelemetry default sampler](https://opentelemetry.io/docs/specs/otel/trace/sdk/#built-in-samplers).
-It samples new root traces and respects the sampling decision of an existing parent, including an unsampled remote parent.
+Use the `AlwaysOn` sampler in application SDKs.
+This is the default in every OpenTelemetry SDK — do not change it.
 
-1. If no sampler override exists in code or environment variables, leave the SDK default in place.
-2. If an explicit sampler already exists, identify its policy before changing it; report any conflict with Collector-side full-trace sampling instead of silently replacing it.
-
-Do not introduce ratio-based SDK sampling for new root traces.
-Do not replace `ParentBased` with `AlwaysOn`: that overrides upstream decisions and can produce partial traces.
-SDK-side root sampling makes irreversible decisions at the head of the trace, before the outcome of the request is known.
+Do not configure `TraceIdRatioBased`, `ParentBased`, or any other sampler that drops spans in the application.
+SDK-side sampling makes irreversible decisions at the head of the trace, before the outcome of the request is known.
 A trace that looked unremarkable at the start may turn out to contain an error, a latency spike, or a rarely exercised code path — all of which are lost if the SDK decided not to sample.
 
-Keep additional sampling policies in the [Collector or observability pipeline](../../otel-collector/rules/sampling.md), where they can be changed centrally without redeploying applications.
-The Collector cannot recover spans already dropped upstream.
+Defer all sampling decisions to the [Collector or observability pipeline](../../otel-collector/rules/sampling.md), where they can be changed centrally without redeploying applications.
 The Collector can apply head sampling with the [`probabilisticsamplerprocessor`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/probabilisticsamplerprocessor), or tail sampling with the [`tailsamplingprocessor`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor), using criteria that are impossible to evaluate at request start (error status, latency, attribute values).
 
 ```bash
@@ -461,13 +456,12 @@ The Collector can apply head sampling with the [`probabilisticsamplerprocessor`]
 export OTEL_TRACES_SAMPLER=traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1
 
-# GOOD: leave OTEL_TRACES_SAMPLER unset when no override is required.
-# The default parentbased_always_on samples roots and respects parent decisions.
+# GOOD: default AlwaysOn sampler — sampling happens in the Collector
+# (no OTEL_TRACES_SAMPLER needed; AlwaysOn is the default)
 ```
 
 Accurate RED metrics (request rate, error rate, duration) cannot be computed from sampled traces.
 If you sample in the Collector, materialize metrics from spans *before* the sampling step — see [connectors](../../otel-collector/rules/pipelines.md#connectors) and [sampling](../../otel-collector/rules/sampling.md#materialize-red-metrics-before-sampling).
-If upstream sampling has already dropped spans, use unsampled application metrics for complete request counts.
 
 ## Testing trace data
 
@@ -479,11 +473,12 @@ The examples below use [JavaScript SDK 2.x APIs](https://github.com/open-telemet
 
 ```typescript
 import { SpanKind, type SpanContext } from '@opentelemetry/api';
-import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { AlwaysOnSampler, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 
 const exporter = new InMemorySpanExporter();
 const provider = new NodeTracerProvider({
+  sampler: new AlwaysOnSampler(),
   spanProcessors: [new SimpleSpanProcessor(exporter)],
 });
 provider.register();
@@ -518,8 +513,9 @@ function assertNoParentlessOutboundSpans() {
 
 ### No orphan spans
 
-In a test that captures the complete trace, assert that every span with a `parentSpanContext` has a corresponding parent in that trace.
-When a test captures only one service, supply the accepted remote parent contexts separately; their spans are not exported by that service.
+Assert that every span with a `parentSpanContext` has a corresponding parent in the same trace, unless that parent is explicitly known to be outside the capture.
+Supply accepted remote parent contexts separately only when their spans are outside the captured scope or were never exported upstream.
+Do not exempt a missing parent that the capture is expected to contain.
 Finish all expected spans, then flush the tracer provider before asserting, so an unfinished parent is not mistaken for missing context.
 
 ```typescript

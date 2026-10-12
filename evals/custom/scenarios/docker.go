@@ -106,12 +106,11 @@ func (d *DockerFixture) Hooks() harness.FixtureHooks {
 }
 
 // ParentTrafficHooks adds parent-context traffic for the Node.js scenario.
-// Send the unsampled request first and roots last so a root span's arrival
-// cannot satisfy the assertion before the parent-context requests run.
+// Probe a sampled remote parent as well as the existing root requests.
 func (d *DockerFixture) ParentTrafficHooks() harness.FixtureHooks {
 	hooks := d.Hooks()
 	hooks.Run = func(ctx context.Context, workspace string, env map[string]string) error {
-		return d.runWithParents(ctx, workspace, env, []string{unsampledTraceparent, sampledTraceparent})
+		return d.runWithParents(ctx, workspace, env, []string{sampledTraceparent})
 	}
 	return hooks
 }
