@@ -77,6 +77,106 @@ func TestAssertHTTPTracesFailsWithoutServerCheckoutSpan(t *testing.T) {
 	require.Contains(t, err.Error(), "/checkout")
 }
 
+func TestNodeHTTPIncomingParents(t *testing.T) {
+	decode := func(s string) []byte {
+		b, err := hex.DecodeString(s)
+		require.NoError(t, err)
+		return b
+	}
+	for _, tc := range []struct {
+		name         string
+		change       func([]spanSpec) []spanSpec
+		wantError    string
+		otherService bool
+	}{
+		{name: "root and sampled remote parent"},
+		{name: "wrong remote parent", change: func(spans []spanSpec) []spanSpec {
+			spans[1].parentSpanID = decode("9999999999999999")
+			return spans
+		}, wantError: "has parent"},
+		{name: "wrong remote trace", change: func(spans []spanSpec) []spanSpec {
+			spans[1].traceID = decode("99999999999999999999999999999999")
+			return spans
+		}, wantError: "continuing the sampled remote parent"},
+		{name: "remote context ignored", change: func(spans []spanSpec) []spanSpec {
+			spans[1].traceID, spans[1].parentSpanID = spans[0].traceID, nil
+			return spans
+		}, wantError: "continuing the sampled remote parent"},
+		{name: "no root request", change: func(spans []spanSpec) []spanSpec {
+			return spans[1:]
+		}, wantError: "no root SERVER"},
+		{name: "root request has a parent", change: func(spans []spanSpec) []spanSpec {
+			spans[0].parentSpanID = decode("9999999999999999")
+			return spans
+		}, wantError: "no root SERVER"},
+		{name: "missing remote client", change: func(spans []spanSpec) []spanSpec {
+			return append(spans[:2], spans[3:]...)
+		}, wantError: "no outbound CLIENT"},
+		{name: "client in another trace", change: func(spans []spanSpec) []spanSpec {
+			spans[2].traceID = spans[0].traceID
+			return spans
+		}, wantError: "no outbound CLIENT"},
+		{name: "client with missing parent", change: func(spans []spanSpec) []spanSpec {
+			spans[2].parentSpanID = decode("9999999999999999")
+			return spans
+		}, wantError: "no outbound CLIENT"},
+		{name: "parent with same ID in another trace", change: func(spans []spanSpec) []spanSpec {
+			// A span from another trace must not bridge the CLIENT to the SERVER.
+			spans[3].parentSpanID = spans[1].spanID
+			spans[2].parentSpanID = spans[3].spanID
+			return spans
+		}, wantError: "no outbound CLIENT"},
+		{name: "client parent cycle", change: func(spans []spanSpec) []spanSpec {
+			spans[2].parentSpanID = spans[2].spanID
+			return spans
+		}, wantError: "no outbound CLIENT"},
+		{name: "internal span between server and client", change: func(spans []spanSpec) []spanSpec {
+			internal := spanSpec{name: "inventory", kind: tracepb.Span_SPAN_KIND_INTERNAL,
+				traceID: spans[1].traceID, spanID: decode("9999999999999999"), parentSpanID: spans[1].spanID}
+			spans[2].parentSpanID = internal.spanID
+			return append(spans, internal)
+		}},
+		{name: "retried remote request", change: func(spans []spanSpec) []spanSpec {
+			retry := spans[1]
+			retry.spanID = decode("9999999999999999")
+			return append(spans, retry)
+		}},
+		{name: "another service does not interfere", otherService: true},
+		{name: "another service cannot supply the remote server", otherService: true, change: func(spans []spanSpec) []spanSpec {
+			return append(spans[:1], spans[2:]...)
+		}, wantError: "continuing the sampled remote parent"},
+		{name: "another service cannot supply the remote client", otherService: true, change: func(spans []spanSpec) []spanSpec {
+			return append(spans[:2], spans[3:]...)
+		}, wantError: "no outbound CLIENT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := otelsink.Start(t)
+			root := serverSpan(map[string]string{"http.request.method": "GET", "url.path": "/checkout"})
+			root.traceID, root.spanID = decode("55555555555555555555555555555555"), decode("6666666666666666")
+			remote := serverSpan(map[string]string{"http.method": "GET", "http.target": "/checkout"})
+			remote.traceID, remote.spanID, remote.parentSpanID = decode(sampledTraceID), decode("7777777777777777"), decode(sampledParentID)
+			outbound := clientSpan(map[string]string{"http.request.method": "GET"})
+			outbound.traceID, outbound.spanID, outbound.parentSpanID = remote.traceID, decode("8888888888888888"), remote.spanID
+			rootClient := clientSpan(map[string]string{"http.request.method": "GET"})
+			rootClient.traceID, rootClient.spanID, rootClient.parentSpanID = root.traceID, decode("1111111111111111"), root.spanID
+			spans := []spanSpec{root, remote, outbound, rootClient}
+			if tc.change != nil {
+				spans = tc.change(spans)
+			}
+			feedSpans(t, sink, map[string]string{"service.name": NodeServiceName}, spans...)
+			if tc.otherService {
+				feedSpans(t, sink, map[string]string{"service.name": "TEST-other-service"}, remote, outbound)
+			}
+			err := NodeHTTP().Assert(t, sink)
+			if tc.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantError)
+			}
+		})
+	}
+}
+
 // The stdout correlation assertion of the go-logs scenario, end to end
 // against a real sink: the record's (trace_id, span_id) pair must name an
 // exported span of the right service, and OTLP application logs are refused.

@@ -11,6 +11,7 @@
 //	    against url, retrying until the target is ready or PROBE_TIMEOUT
 //	    (default 60s) elapses. Exits non-zero when the requests cannot be
 //	    completed, failing the scenario's Run hook.
+//	    PROBE_TRACEPARENT optionally supplies an incoming W3C traceparent.
 //
 // All data served is obviously synthetic (TEST-SKU-0001 style).
 package main
@@ -91,7 +92,14 @@ func probe(url string, count int) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("probe %s: %d/%d requests succeeded before the %s deadline (last error: %v)", url, succeeded, count, timeout, lastErr)
 		}
-		resp, err := client.Get(url)
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		if parent := os.Getenv("PROBE_TRACEPARENT"); parent != "" {
+			req.Header.Set("traceparent", parent)
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			time.Sleep(500 * time.Millisecond)
