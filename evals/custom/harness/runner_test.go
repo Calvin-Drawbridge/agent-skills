@@ -64,12 +64,45 @@ func TestRunnerHappyPath(t *testing.T) {
 	require.Equal(t, 1, v.AgentAttempts)
 	require.Equal(t, 0, v.InfraRetries)
 	require.False(t, v.Flake)
-	require.InDelta(t, 0.05, v.CostUSD, 1e-9, "cost from the result event's total_cost_usd")
+	require.NotNil(t, v.CostUSD)
+	require.InDelta(t, 0.05, *v.CostUSD, 1e-9, "cost from the result event's total_cost_usd")
 	require.Len(t, v.Evidence.TranscriptPaths, 1)
 	require.FileExists(t, v.Evidence.TranscriptPaths[0])
 	require.NotEmpty(t, v.Evidence.TelemetryPaths)
 	for _, p := range v.Evidence.TelemetryPaths {
 		require.FileExists(t, p)
+	}
+}
+
+// A reported subtotal must not masquerade as the cost of the whole run.
+func TestRunnerUnknownCostRemainsUnknownAcrossRetries(t *testing.T) {
+	for _, missingFirst := range []bool{true, false} {
+		t.Run(fmt.Sprint(missingFirst), func(t *testing.T) {
+			counter := filepath.Join(t.TempDir(), "invocations")
+			first, last := testutil.ResultLine, `{"type":"result","subtype":"success","is_error":false}`
+			if missingFirst {
+				first, last = last, first
+			}
+			body := fmt.Sprintf("#!/bin/sh\necho x >> %s\n", shellQuote(counter))
+			body += testutil.CatBody(testutil.InitLineWithSkill(string(SkillInstrumentation)))
+			body += fmt.Sprintf("if [ \"$(wc -l < %s)\" -eq 1 ]; then\n%selse\n%sfi\n", shellQuote(counter), testutil.CatBody(first), testutil.CatBody(last))
+			attempt := 0
+			hooks := FixtureHooks{Run: func(ctx context.Context, _ string, env map[string]string) error {
+				attempt++
+				attrs := map[string]string{"service.name": "checkout"}
+				if attempt == 1 {
+					attrs = nil
+				}
+				return sendTestSpan(ctx, env, "GET /checkout", attrs)
+			}}
+			r := newRunner(t, testutil.WriteStub(t, body), hooks)
+			sc := testScenario()
+			sc.TelemetryTimeout = 200 * time.Millisecond
+			v := r.Run(t, sc)
+			require.True(t, v.Passed, v.Detail)
+			require.True(t, v.Flake)
+			require.Nil(t, v.CostUSD)
+		})
 	}
 }
 

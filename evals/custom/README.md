@@ -1,23 +1,24 @@
 # Skill evals
 
 This directory contains the eval harness that checks whether an agent following the skills in this repository produces working telemetry.
-Claude Code runs headless against fixture applications, and deterministic assertions on the telemetry received over OTLP decide pass or fail — no LLM judge participates in the verdict.
+Claude Code (the default) or the opt-in Codex backend runs headless against fixture applications, and deterministic assertions on the telemetry received over OTLP decide pass or fail — no LLM judge participates in the verdict.
 This README is the operator manual; the plan behind the design lives at [docs/plans/2026-07-17-001-feat-skill-evals-ci-plan.md](../../docs/plans/2026-07-17-001-feat-skill-evals-ci-plan.md).
 
 ## Architecture
 
 A scenario run has 4 moving parts:
 
-- **Agent under test** — the pinned Claude Code CLI (see [`versions.env`](./versions.env)) runs headless with `--bare --plugin-dir <repo root>`, so only the skills in this repository are loaded, and edits a temporary copy of a fixture application.
+- **Agent under test** — the pinned Claude Code CLI (see [`versions.env`](./versions.env)) runs headless with `--bare --plugin-dir <repo root>`, or the opt-in Codex CLI runs with an isolated home and a copy of this repository’s skills.
+  Both edit a temporary copy of a fixture application through the [`AgentInvoker`](./harness/agent.go) interface.
 - **Relay** — a dual-homed OTLP relay container is the only egress the running fixture can reach (requirement R21); it forwards telemetry to the sink and requires a per-run bearer token on externally reachable paths.
 - **Sink** — an in-process `otelsink` (from [opentelemetry-packaging](https://github.com/open-telemetry/opentelemetry-packaging)) on loopback receives everything the relay forwards; per-run isolation rides on a `test.id` resource attribute.
 - **Verdicts** — the harness queries the sink and emits a verdict with a failure class: `infra` (retried up to 3 times, never skill-attributed), `agent-noskill` (no evidence the skill entered context), `agent-build`, `agent-telemetry`, or `agent-assert` (agent-attributable classes retry once).
   Verdict evidence includes the agent transcript and the received telemetry.
-  On failure the harness also copies each attempt's transcript (token-scrubbed) into `$EVAL_VERDICT_DIR/transcripts/<scenario>/<attempt>/`, next to the preserved `agent-workspace/`, so it ships with the uploaded CI evidence artifact.
+  The harness copies every attempt’s transcript (token-scrubbed) into `$EVAL_VERDICT_DIR/transcripts/<scenario>/<attempt>/`, and preserves the agent’s workspace on failure, so evidence survives temporary-directory cleanup.
 
 ## Running locally
 
-You need Go, Docker, an `ANTHROPIC_API_KEY`, and a `claude` binary on `PATH` (CI pins the version through `CLAUDE_CODE_VERSION` in [`versions.env`](./versions.env); set `EVAL_AGENT_BINARY` to point at a different binary).
+For the default Claude backend, you need Go, Docker, an `ANTHROPIC_API_KEY`, and a `claude` binary on `PATH` (CI pins the version through `CLAUDE_CODE_VERSION` in [`versions.env`](./versions.env); set `EVAL_AGENT_BINARY` to point at a different binary).
 All commands run from the `evals/custom/` directory.
 
 Keep the API key in a local `.env` file instead of the command line: copy the repository-root [`.env.example`](../../.env.example) to `.env` in the repository root and set `ANTHROPIC_API_KEY`.
@@ -27,7 +28,7 @@ The scenario entrypoints load the repository-root `.env` automatically before ru
 Harness and unit tests are hermetic — no Docker, network, or secrets:
 
 ```bash
-go test ./...
+go test ./... -short
 ```
 
 Run 1 agent scenario end to end (the key comes from `.env`):
@@ -42,7 +43,53 @@ Run a selected set with the `EVAL_SCENARIOS` filter (comma-separated scenario ID
 EVAL_SCENARIOS=instr-go-http,instr-nodejs-http go test ./scenarios -run TestScenarios -v -timeout 60m
 ```
 
-Agent scenarios skip cleanly when Docker or the API key is unavailable, so a plain `go test ./...` never invokes the real agent.
+Agent scenarios skip when required infrastructure or the selected backend’s credentials are unavailable.
+Use `go test ./... -short` for hermetic validation even when credentials are configured.
+
+### Opt-in Codex evaluations
+
+Set `EVAL_AGENT=codex` to use the same scenario entrypoints, fixture hooks, OTLP relay, sink assertions, and retry policy with Codex.
+The adapter requires CLI version `0.162.1`, pinned by `CodexCLIVersion` in [`harness/codex.go`](./harness/codex.go), and checks the version before every invocation.
+Set `EVAL_CODEX_MODEL` explicitly to the model ID you intend to evaluate; the adapter does not reuse Claude’s `EVAL_MODEL` or your personal Codex model settings.
+Reasoning effort is fixed to `medium`, and verdicts record the backend, CLI version, model, and effort.
+
+For a local ChatGPT subscription run, first sign in with `codex login`, then run from `evals/custom/`:
+
+```bash
+EVAL_AGENT=codex EVAL_CODEX_AUTH=chatgpt \
+  EVAL_CODEX_MODEL="${EVAL_CODEX_MODEL:?Set the model ID to evaluate}" \
+  EVAL_SCENARIOS=collector-pipeline-hardening,ottl-redaction \
+  EVAL_VERDICT_DIR=/tmp/codex-eval-evidence \
+  go test ./scenarios -run TestScenarios -count=1 -v -timeout 30m
+```
+
+Subscription authentication is explicitly opt-in and rejected when `CI` or `GITHUB_ACTIONS` is set.
+It copies only the existing `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) into a temporary directory with private permissions; personal config, plugins, MCP servers, and skills are not copied.
+The temporary login is removed after each invocation, and the original login file is not modified.
+File-based ChatGPT login is required; keychain-only credentials are not imported.
+
+For API authentication, provide `CODEX_API_KEY` in the invoking process’s environment and select `EVAL_CODEX_AUTH=api` (the default for Codex).
+The adapter never silently falls back from API authentication to subscription quota, or from Codex to Claude.
+`EVAL_AGENT_BINARY` overrides the selected CLI path; it does not select the backend.
+
+Codex uses [`codex exec --json`](https://developers.openai.com/codex/noninteractive) with a temporary `HOME`, `CODEX_HOME`, and XDG configuration/cache directories, a restricted inherited environment, and the `workspace-write` sandbox with command networking enabled for build tools.
+The prompt explicitly selects the skill and requests a full `SKILL.md` read; the adapter requires the original contents in a successful command result before the fixture can pass.
+A path mention or an assistant’s claim that it used the skill is insufficient evidence.
+This confirms the skill entered context; it does not establish the skill’s incremental benefit without a separate skill-off control.
+
+Codex has no equivalent of Claude’s `--max-turns`: scenario `Timeout` bounds its invocation, and `MaxTurns` applies only to Claude.
+On Unix, cancellation kills the CLI’s process group, including child commands; on other systems, it kills the CLI and bounds output-pipe cleanup, without guaranteeing descendant cleanup.
+Malformed or incomplete JSON, missing skill evidence, terminal API failures, and unsuccessful CLI exits cannot produce a passing verdict.
+Recoverable stream errors followed by successful completion do not consume an infrastructure retry.
+
+Codex reports token usage, but not a dollar cost.
+`cost_usd` is therefore `null`, never a fabricated `0`; it is also `null` when any attempt lacks cost data.
+The optional `usage` field sums reported tokens only when every attempt reported them, and cached input tokens are already included in input tokens.
+Raw per-attempt transcripts retain available usage when the aggregate is incomplete.
+
+The existing GitHub workflows continue to use Claude; this backend does not add paid CI jobs, secrets, or a cross-agent matrix.
+Enable credentialed Codex CI only through a separate maintainer-approved change on trusted runners with explicit model, spending, and isolation policies.
+Temporary configuration isolation is not a host security boundary: managed/admin settings and bundled system skills can still apply, and fixture code must remain trusted.
 
 ## Running example validation
 
@@ -107,7 +154,7 @@ Add an entry with the scenario ID, the date, and a link to the tracking issue; r
 
 ## Bumping pinned versions
 
-[`versions.env`](./versions.env) pins everything the harness shells out to:
+[`versions.env`](./versions.env) pins the default agent backend and fixture toolchain:
 
 - `CLAUDE_CODE_VERSION` — the Claude Code CLI version CI installs.
 - `EVAL_MODEL` — the model ID passed to `--model`.

@@ -464,14 +464,8 @@ func TestKubernetesScenarios(t *testing.T) {
 	} else if len(loaded) > 0 {
 		t.Logf("loaded %d variable(s) from .env: %s", len(loaded), strings.Join(loaded, ", "))
 	}
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		t.Skip("skipping: ANTHROPIC_API_KEY unset; refusing to invoke the real agent (set it in .env or the environment)")
-	}
-
 	root := testutil.RepoRoot(t)
-	versions, err := harness.LoadVersions(filepath.Join(root, "evals", "custom", "versions.env"))
-	require.NoError(t, err)
-	binary := os.Getenv("EVAL_AGENT_BINARY")
+	agent := configuredAgent(t, root)
 	selected := scenarioFilter(os.Getenv("EVAL_SCENARIOS"))
 	cluster := ensureCluster(t, root)
 
@@ -483,7 +477,7 @@ func TestKubernetesScenarios(t *testing.T) {
 			fix := NewKindFixture(t, cluster, root, sc.ID)
 			runner := &harness.Runner{
 				RepoRoot: root,
-				Agent:    &harness.Agent{Binary: binary, PluginDir: root, Model: versions.EvalModel},
+				Agent:    agent,
 				Hooks:    fix.Hooks(),
 			}
 			v := runner.Run(t, sc)

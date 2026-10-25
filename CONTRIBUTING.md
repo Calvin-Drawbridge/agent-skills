@@ -15,6 +15,10 @@ A failing scenario names where it broke, which is the signal you use to judge sk
 The full operator manual — CI workflows, the quarantine process, and the pinned-version bump process — is [evals/custom/README.md](evals/custom/README.md).
 This section is the local quick start.
 
+Claude Code remains the default backend.
+For Codex, including local ChatGPT subscription authentication, follow [Opt-in Codex evaluations](evals/custom/README.md#opt-in-codex-evaluations).
+Both backends use the same fixtures and deterministic telemetry assertions; Codex does not require an Anthropic key.
+
 ## Prerequisites
 
 - Go at the version pinned in `evals/custom/go.mod` (1.26.3 or newer).
@@ -28,7 +32,8 @@ This section is the local quick start.
 - `kind` for the Kubernetes scenarios only.
 
 Each agent scenario is a real headless agent run, so it costs money — on the order of cents to low dollars per scenario, and tens of dollars for the full matrix.
-Set `EVAL_VERDICT_DIR` to capture each verdict as JSON, which records `total_cost_usd` per run.
+Set `EVAL_VERDICT_DIR` to capture each verdict as JSON, which records `cost_usd` summed across attempts when the CLI reports it.
+Codex reports token usage instead; unavailable dollar cost is `null`.
 
 ## Configuring the API key
 

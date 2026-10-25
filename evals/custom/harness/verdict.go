@@ -71,11 +71,25 @@ type Evidence struct {
 	TelemetryPaths []string `json:"telemetry_paths,omitempty"`
 }
 
+// TokenUsage is the usage reported by Codex for a completed turn. Cached input
+// is a subset of input, not an additional token charge. Counts do not imply a
+// dollar price, including when running with a ChatGPT subscription.
+type TokenUsage struct {
+	InputTokens           int64 `json:"input_tokens"`
+	CachedInputTokens     int64 `json:"cached_input_tokens"`
+	OutputTokens          int64 `json:"output_tokens"`
+	ReasoningOutputTokens int64 `json:"reasoning_output_tokens,omitempty"`
+}
+
 // Verdict is the terminal outcome of running one scenario, after the retry
 // policy has been applied.
 type Verdict struct {
 	// ScenarioID names the scenario this verdict belongs to.
-	ScenarioID string `json:"scenario_id"`
+	ScenarioID      string `json:"scenario_id"`
+	AgentBackend    string `json:"agent_backend,omitempty"`
+	Model           string `json:"model,omitempty"`
+	CLIVersion      string `json:"cli_version,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	// Passed reports whether the scenario ultimately passed.
 	Passed bool `json:"passed"`
 	// Class is the terminal failure class; empty when Passed.
@@ -96,9 +110,11 @@ type Verdict struct {
 	// NonSkillAttributable is true for terminal infra failures: the gate
 	// fails, but the failure must not be reported as a skill failure.
 	NonSkillAttributable bool `json:"non_skill_attributable,omitempty"`
-	// CostUSD is the total agent cost across all attempts, summed from the
-	// CLI's total_cost_usd result field.
-	CostUSD float64 `json:"cost_usd"`
+	// CostUSD sums reported cost across attempts. Null means at least one
+	// attempt did not report cost; Codex must never be presented as free.
+	CostUSD *float64 `json:"cost_usd"`
+	// Usage sums token counts only when every attempt reported them.
+	Usage *TokenUsage `json:"usage,omitempty"`
 	// Evidence points at transcripts and telemetry files.
 	Evidence Evidence `json:"evidence"`
 }

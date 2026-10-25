@@ -121,8 +121,8 @@ type Scenario struct {
 	// DefaultTelemetryTimeout.
 	TelemetryTimeout time.Duration
 
-	// MaxTurns caps the agent's conversation turns (the CLI --max-turns
-	// flag). Zero means DefaultMaxTurns.
+	// MaxTurns caps Claude's conversation turns (--max-turns). Zero means
+	// DefaultMaxTurns. Codex has no equivalent flag; Timeout bounds its run.
 	MaxTurns int
 
 	// Smoke marks the scenario as the smoke scenario for its skill:

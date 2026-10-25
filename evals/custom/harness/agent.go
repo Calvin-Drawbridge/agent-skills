@@ -19,6 +19,12 @@ import (
 // installs exactly that version under this name.
 const DefaultAgentBinary = "claude"
 
+// AgentInvoker is the boundary between CLI-specific execution and the shared
+// fixture, telemetry, and retry machinery.
+type AgentInvoker interface {
+	Invoke(context.Context, Invocation) (*AgentResult, error)
+}
+
 // PluginName is the plugin name under which this repository's skills are
 // exposed to the CLI. Under --bare the CLI publishes plugin skills only as
 // slash commands named "<PluginName>:<skill>", so the harness both injects
@@ -50,7 +56,8 @@ type Agent struct {
 type Invocation struct {
 	// Prompt is the task passed to -p.
 	Prompt string
-	// MaxTurns caps conversation turns; zero means DefaultMaxTurns.
+	// MaxTurns caps Claude conversation turns; zero means DefaultMaxTurns.
+	// Codex has no equivalent CLI flag and is bounded by the context deadline.
 	MaxTurns int
 	// WorkDir is the working directory (the fixture workspace copy).
 	WorkDir string
@@ -65,16 +72,26 @@ type Invocation struct {
 
 // AgentResult is the parsed outcome of one headless agent run.
 type AgentResult struct {
-	// SawInit is true once the system/init event was observed.
+	Backend         string
+	Model           string
+	CLIVersion      string
+	ReasoningEffort string
+	// Usage is nil when the CLI did not report token counts.
+	Usage *TokenUsage
+	// ProtocolError records an invalid or incomplete machine-readable stream.
+	ProtocolError string
+	// SkillLoadDetail is the backend-specific diagnostic for missing evidence.
+	SkillLoadDetail string
+	// SawInit is true once Claude's system/init or Codex's thread.started
+	// event was observed.
 	SawInit bool
 	// PluginErrors carries the plugin_errors entries from the system/init
 	// event; non-empty means the plugin (and so the skills) failed to load
 	// and the attempt is classified ClassInfra before any scenario work.
 	PluginErrors []string
-	// SkillLoaded is true when the system/init event's slash_commands list
-	// includes the target skill's command ("<PluginName>:<skill>"), which
-	// means the CLI resolved the plugin and exposed the skill; a false value
-	// is a harness/plugin failure classified ClassInfra.
+	// SkillLoaded records backend-specific evidence: Claude exposes the
+	// target slash command, or Codex returns the full SKILL.md in a completed
+	// command result. Missing evidence is classified ClassInfra.
 	SkillLoaded bool
 	// SawResult is true once the final result event was observed.
 	SawResult bool
@@ -90,6 +107,8 @@ type AgentResult struct {
 	ResultText string
 	// CostUSD carries total_cost_usd from the result event.
 	CostUSD float64
+	// CostKnown distinguishes an unreported cost from an explicitly reported 0.
+	CostKnown bool
 	// Overloaded is true when API overload markers (429/529, rate limit,
 	// overloaded errors) appeared in the stream or on stderr.
 	Overloaded bool
@@ -166,7 +185,7 @@ func (a *Agent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, error
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	res := &AgentResult{TranscriptPath: inv.TranscriptPath}
+	res := &AgentResult{Backend: "claude", Model: a.Model, TranscriptPath: inv.TranscriptPath}
 	parser := &streamParser{inv: &inv, res: res}
 
 	if err := cmd.Start(); err != nil {
@@ -217,10 +236,12 @@ func classifyAgentRun(res *AgentResult) (FailureClass, string) {
 		return ClassInfra, "API overload marker (429/529/rate limit) in agent output"
 	case res.TimedOut:
 		return ClassAgentTelemetry, "agent killed at wall-clock timeout before telemetry could be produced"
+	case res.ProtocolError != "":
+		return ClassInfra, "invalid CLI event stream: " + res.ProtocolError
 	case res.ExitErr != nil && !res.SawResult:
 		return ClassInfra, fmt.Sprintf("CLI exited without a result event: %v", res.ExitErr)
 	case !res.SawResult:
-		return ClassInfra, "CLI stream ended without a result event"
+		return ClassInfra, appendResultText("CLI stream ended without a result event", res.ResultText)
 	case res.IsError:
 		// The CLI reported the run itself as an error. API, auth, and overload
 		// shapes are infrastructure; max-turns and execution errors are the
@@ -231,6 +252,9 @@ func classifyAgentRun(res *AgentResult) (FailureClass, string) {
 		}
 		return ClassAgentTelemetry, appendResultText(fmt.Sprintf("CLI reported an error result before telemetry could be produced (subtype %q)", res.ResultSubtype), res.ResultText)
 	case !res.SkillLoaded:
+		if res.SkillLoadDetail != "" {
+			return ClassInfra, res.SkillLoadDetail
+		}
 		return ClassInfra, "the plugin did not expose the target skill command in system/init slash_commands; the harness could not load the skill (check --plugin-dir and .claude-plugin/plugin.json)"
 	default:
 		return ClassNone, ""
@@ -292,6 +316,7 @@ func (p *streamParser) feed(line []byte) {
 		p.res.SawResult = true
 		if cost, ok := ev["total_cost_usd"].(float64); ok {
 			p.res.CostUSD = cost
+			p.res.CostKnown = true
 		}
 		if isErr, ok := ev["is_error"].(bool); ok {
 			p.res.IsError = isErr

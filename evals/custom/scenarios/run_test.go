@@ -2,6 +2,7 @@ package scenarios
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +16,7 @@ import (
 )
 
 // TestScenarios is the eval entrypoint: it runs every registered scenario end
-// to end — real Claude Code CLI (pinned via evals/custom/versions.env), real fixture
+// to end — real agent CLI (Claude by default, Codex opt-in), real fixture
 // infrastructure — and fails on any red verdict. It skips cleanly when the
 // API key is unavailable, and each scenario skips when the infrastructure it
 // needs (Docker, or the pinned otelcol-contrib binary for the Collector
@@ -41,14 +42,8 @@ func TestScenarios(t *testing.T) {
 	} else if len(loaded) > 0 {
 		t.Logf("loaded %d variable(s) from .env: %s", len(loaded), strings.Join(loaded, ", "))
 	}
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		t.Skip("skipping: ANTHROPIC_API_KEY unset; refusing to invoke the real agent (set it in .env or the environment)")
-	}
-
 	root := testutil.RepoRoot(t)
-	versions, err := harness.LoadVersions(filepath.Join(root, "evals", "custom", "versions.env"))
-	require.NoError(t, err)
-	binary := os.Getenv("EVAL_AGENT_BINARY")
+	agent := configuredAgent(t, root)
 	selected := scenarioFilter(os.Getenv("EVAL_SCENARIOS"))
 
 	for _, sc := range All() {
@@ -56,7 +51,7 @@ func TestScenarios(t *testing.T) {
 			if !selected(sc.ID) {
 				t.Skip("skipped by the EVAL_SCENARIOS filter")
 			}
-			v := runOne(t, root, root, binary, versions.EvalModel, sc)
+			v := runOne(t, root, agent, sc)
 			if !v.Passed {
 				t.Errorf("scenario %s failed with class %s: %s", sc.ID, v.Class, v.Detail)
 			}
@@ -68,16 +63,29 @@ func TestScenarios(t *testing.T) {
 // fixtureHooksFor): host-process otelcol-contrib for the Collector-backed
 // scenarios, the Docker topology for everything else (the browser scenario
 // gets its Chromium-driven variant via fixtureHooks).
-func runOne(t *testing.T, repoRootDir, pluginDir, binary, model string, sc harness.Scenario) harness.Verdict {
+func runOne(t *testing.T, repoRootDir string, agent harness.AgentInvoker, sc harness.Scenario) harness.Verdict {
 	t.Helper()
 	runner := &harness.Runner{
 		RepoRoot: repoRootDir,
-		Agent:    &harness.Agent{Binary: binary, PluginDir: pluginDir, Model: model},
+		Agent:    agent,
 		Hooks:    fixtureHooksFor(t, sc),
 	}
 	v := runner.Run(t, sc)
 	logVerdict(t, v)
 	return v
+}
+
+// Both entrypoints must select the same backend and credential policy.
+func configuredAgent(t *testing.T, root string) harness.AgentInvoker {
+	t.Helper()
+	versions, err := harness.LoadVersions(filepath.Join(root, "evals", "custom", "versions.env"))
+	require.NoError(t, err)
+	agent, err := harness.AgentFromEnv(root, versions)
+	if errors.Is(err, harness.ErrAgentCredentialsUnavailable) {
+		t.Skipf("skipping: %v", err)
+	}
+	require.NoError(t, err)
+	return agent
 }
 
 // logVerdict records the verdict JSON (which never carries token material)

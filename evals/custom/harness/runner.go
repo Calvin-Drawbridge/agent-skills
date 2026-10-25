@@ -60,7 +60,7 @@ type Runner struct {
 	// paths and skill directories resolve against it.
 	RepoRoot string
 	// Agent invokes the CLI (its Binary is injectable for tests).
-	Agent *Agent
+	Agent AgentInvoker
 	// Hooks build and run the fixture; see FixtureHooks.
 	Hooks FixtureHooks
 }
@@ -93,6 +93,7 @@ type attemptOutcome struct {
 	class          FailureClass
 	detail         string
 	cost           float64
+	agent          *AgentResult
 	transcriptPath string
 	telemetryPaths []string
 }
@@ -108,7 +109,7 @@ type attemptOutcome struct {
 func (r *Runner) Run(t *testing.T, sc Scenario) Verdict {
 	t.Helper()
 
-	v := Verdict{ScenarioID: sc.ID}
+	v := Verdict{ScenarioID: sc.ID, CostUSD: new(float64), Usage: &TokenUsage{}}
 	runDir := t.TempDir()
 	infraFailures := 0
 	agentAttempts := 0
@@ -116,7 +117,23 @@ func (r *Runner) Run(t *testing.T, sc Scenario) Verdict {
 
 	for attempt := 1; ; attempt++ {
 		out := r.attempt(t, sc, filepath.Join(runDir, fmt.Sprintf("attempt-%d", attempt)))
-		v.CostUSD += out.cost
+		if out.agent == nil || !out.agent.CostKnown {
+			v.CostUSD = nil
+		} else if v.CostUSD != nil {
+			*v.CostUSD += out.cost
+		}
+		if out.agent == nil || out.agent.Usage == nil {
+			v.Usage = nil
+		} else if v.Usage != nil {
+			v.Usage.InputTokens += out.agent.Usage.InputTokens
+			v.Usage.CachedInputTokens += out.agent.Usage.CachedInputTokens
+			v.Usage.OutputTokens += out.agent.Usage.OutputTokens
+			v.Usage.ReasoningOutputTokens += out.agent.Usage.ReasoningOutputTokens
+		}
+		if out.agent != nil {
+			v.AgentBackend, v.Model, v.CLIVersion = out.agent.Backend, out.agent.Model, out.agent.CLIVersion
+			v.ReasoningEffort = out.agent.ReasoningEffort
+		}
 		if out.transcriptPath != "" {
 			v.Evidence.TranscriptPaths = append(v.Evidence.TranscriptPaths, out.transcriptPath)
 		}
@@ -201,19 +218,23 @@ func (r *Runner) attempt(t *testing.T, sc Scenario, attemptDir string) attemptOu
 	defer relay.Close()
 
 	env := FixtureEnv(sink, relay, token)
+	var res *AgentResult
 	finish := func(class FailureClass, detail string, cost float64, transcript string) attemptOutcome {
+		// Keep successful transcripts too: they substantiate skill loading
+		// and usage when comparing agent backends after temporary dirs vanish.
+		preserveTranscript(sc.ID, attemptDir, token)
 		if class != ClassNone {
 			// On any failure, preserve the agent-authored source and the agent
 			// transcript (both scrubbed of the per-run token) for post-mortem,
 			// since the containers and the attempt temp dir are torn down
 			// before they can be inspected.
 			preserveAgentWorkspace(sc.ID, workdir, token)
-			preserveTranscript(sc.ID, attemptDir, token)
 		}
 		return attemptOutcome{
 			class:          class,
 			detail:         detail,
 			cost:           cost,
+			agent:          res,
 			transcriptPath: transcript,
 			telemetryPaths: telemetryFiles(sink.Dir()),
 		}
@@ -221,7 +242,7 @@ func (r *Runner) attempt(t *testing.T, sc Scenario, attemptDir string) attemptOu
 
 	// Invoke the agent against the workspace.
 	transcript := filepath.Join(attemptDir, "transcript.jsonl")
-	res, err := r.Agent.Invoke(ctx, Invocation{
+	res, err = r.Agent.Invoke(ctx, Invocation{
 		Prompt:         sc.Prompt,
 		MaxTurns:       sc.MaxTurns,
 		WorkDir:        workdir,
