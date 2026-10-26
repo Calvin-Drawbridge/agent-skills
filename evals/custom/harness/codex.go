@@ -24,12 +24,17 @@ type CodexAgent struct {
 	Binary   string
 	RepoRoot string
 	Model    string
-	// AuthFile explicitly opts local runs into a saved ChatGPT login. Empty
-	// uses CODEX_API_KEY. Credentials stay outside the fixture/evidence tree.
-	AuthFile string
+	// AuthHome explicitly opts local runs into a dedicated, persistent
+	// evaluation login. Empty uses CODEX_API_KEY. Never copy a refresh token
+	// into a disposable home: rotation would invalidate the source login.
+	AuthHome string
 }
 
 func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, error) {
+	ctx, finishSignals := agentSignalContext(ctx)
+	// Registered first so interruption is re-raised only after child and
+	// temporary-directory cleanup. It must not become a retryable timeout.
+	defer finishSignals()
 	// The CLI has no --max-turns equivalent. Always enforce a wall-clock
 	// ceiling, including callers that do not use Runner.
 	var cancel context.CancelFunc
@@ -45,7 +50,7 @@ func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, 
 	if !slices.Contains(Skills, inv.Skill) {
 		return nil, fmt.Errorf("codex: unknown skill %q", inv.Skill)
 	}
-	if a.AuthFile != "" && (os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "") {
+	if a.AuthHome != "" && (os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "") {
 		return nil, fmt.Errorf("codex: saved ChatGPT authentication is local-only")
 	}
 
@@ -55,6 +60,12 @@ func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, 
 	}
 	defer os.RemoveAll(home)
 	codexHome := filepath.Join(home, ".codex")
+	if a.AuthHome != "" {
+		codexHome, err = validateCodexAuthHome(a.AuthHome)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		return nil, err
 	}
@@ -67,13 +78,8 @@ func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, 
 	if err != nil || len(bytes.TrimSpace(skill)) == 0 {
 		return nil, fmt.Errorf("codex: target SKILL.md is missing or empty")
 	}
-	if a.AuthFile != "" {
-		if err := copyCodexAuth(a.AuthFile, filepath.Join(codexHome, "auth.json")); err != nil {
-			return nil, err
-		}
-	}
-	env := codexEnv(home, inv.Env)
-	if a.AuthFile == "" {
+	env := codexEnv(home, codexHome, inv.Env)
+	if a.AuthHome == "" {
 		env = append(env, "CODEX_API_KEY="+os.Getenv("CODEX_API_KEY"))
 	}
 	binary := a.Binary
@@ -83,7 +89,9 @@ func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, 
 	versionCmd := exec.CommandContext(ctx, binary, "--version")
 	versionCmd.Env = env
 	versionCmd.WaitDelay = 2 * time.Second
+	configureAgentCancellation(versionCmd)
 	version, err := versionCmd.Output()
+	stopAgentProcesses(versionCmd)
 	if err != nil {
 		return nil, fmt.Errorf("codex: check CLI version: %w", err)
 	}
@@ -97,7 +105,7 @@ func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, 
 	prompt := fmt.Sprintf("$%s\nBefore editing the fixture, read the full skill instructions with cat %s. Follow those instructions and their referenced rules.\n\n%s",
 		inv.Skill, shellQuote(skillPath), inv.Prompt)
 	args := []string{
-		"exec", "--json", "--ephemeral", "--ignore-user-config",
+		"exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "--color", "never",
 		"--sandbox", "workspace-write",
 		"--model", a.Model,
@@ -106,6 +114,7 @@ func (a *CodexAgent) Invoke(ctx context.Context, inv Invocation) (*AgentResult, 
 		"-c", "project_doc_max_bytes=0",
 		"-c", `web_search="disabled"`,
 		"-c", `model_reasoning_effort="medium"`,
+		"-c", `cli_auth_credentials_store="file"`,
 		"-c", "shell_environment_policy.experimental_use_profile=false",
 		"-c", `shell_environment_policy.exclude=["CODEX_API_KEY","OPENAI_API_KEY","ANTHROPIC_API_KEY"]`,
 		"-", // prompt on stdin, never interpreted by a shell
@@ -159,10 +168,65 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
-func copyCodexAuth(src, dst string) error {
-	data, err := os.ReadFile(src)
+// Keep evaluation tokens in their own persistent CODEX_HOME so the CLI can
+// atomically refresh them itself. Reject aliases of either personal home;
+// copying back over a concurrent interactive login is not safe.
+func validateCodexAuthHome(home string) (string, error) {
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("codex: EVAL_CODEX_AUTH_HOME must be an absolute path to a dedicated evaluation login")
+	}
+	home, err := filepath.EvalSymlinks(home)
 	if err != nil {
-		return fmt.Errorf("codex: read saved login: %w", err)
+		return "", fmt.Errorf("codex: evaluation login unavailable; sign in with CODEX_HOME set to EVAL_CODEX_AUTH_HOME: %w", err)
+	}
+	homeInfo, err := os.Stat(home)
+	if err != nil || !homeInfo.IsDir() {
+		return "", fmt.Errorf("codex: EVAL_CODEX_AUTH_HOME must be a directory")
+	}
+	info, err := os.Lstat(filepath.Join(home, "auth.json"))
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("codex: evaluation auth.json must be a regular file; run codex login with the dedicated CODEX_HOME")
+	}
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	for _, personal := range []string{os.Getenv("CODEX_HOME"), filepath.Join(userHome, ".codex")} {
+		if personal == "" {
+			continue
+		}
+		personalInfo, err := os.Stat(personal)
+		if err == nil && os.SameFile(homeInfo, personalInfo) {
+			return "", fmt.Errorf("codex: EVAL_CODEX_AUTH_HOME must be separate from your personal CODEX_HOME; create a dedicated evaluation login")
+		}
+		personalAuth, err := os.Stat(filepath.Join(personal, "auth.json"))
+		if err == nil && os.SameFile(info, personalAuth) {
+			return "", fmt.Errorf("codex: evaluation auth.json must not alias your personal login; create a dedicated evaluation login")
+		}
+	}
+	// --ignore-user-config only skips config.toml. Persistent global
+	// instructions, memories, or custom skills would contaminate the eval.
+	for _, name := range []string{"AGENTS.md", "AGENTS.override.md", "rules", "memories", "memory_summary.md"} {
+		if _, err := os.Lstat(filepath.Join(home, name)); !os.IsNotExist(err) {
+			return "", fmt.Errorf("codex: evaluation home contains or cannot inspect %s; use a clean dedicated login", name)
+		}
+	}
+	skillsPath := filepath.Join(home, "skills")
+	if st, err := os.Lstat(skillsPath); err == nil && !st.IsDir() {
+		return "", fmt.Errorf("codex: evaluation skills path must be a directory, not an alias")
+	}
+	entries, err := os.ReadDir(skillsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("codex: cannot inspect evaluation skills: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != ".system" || !entry.IsDir() {
+			return "", fmt.Errorf("codex: evaluation home contains custom skills; use a clean dedicated login")
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	if err != nil {
+		return "", fmt.Errorf("codex: read evaluation login: %w", err)
 	}
 	var auth struct {
 		AuthMode string `json:"auth_mode"`
@@ -171,20 +235,22 @@ func copyCodexAuth(src, dst string) error {
 		} `json:"tokens"`
 	}
 	if json.Unmarshal(data, &auth) != nil || auth.AuthMode != "chatgpt" || auth.Tokens == nil || auth.Tokens.AccessToken == "" {
-		return fmt.Errorf("codex: auth.json is not a ChatGPT login; run codex login first")
+		return "", fmt.Errorf("codex: auth.json is not a ChatGPT login; run codex login with the dedicated CODEX_HOME")
 	}
-	if err := os.WriteFile(dst, data, 0o600); err != nil {
-		return fmt.Errorf("codex: stage saved login: %w", err)
-	}
-	return nil
+	return home, nil
 }
 
 // codexEnv starts with a small OS/tooling allowlist. In particular it does not
 // inherit personal OTLP exporters, provider URLs, credentials, or Codex config.
 // Invocation env supplies only the fixture contract; isolation keys win last.
-func codexEnv(home string, extra map[string]string) []string {
+func codexEnv(home, codexHome string, extra map[string]string) []string {
 	env := map[string]string{}
-	for _, key := range []string{"PATH", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
+	for _, key := range []string{
+		"PATH", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "LANG", "LC_ALL",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	} {
 		if value, ok := os.LookupEnv(key); ok {
 			env[key] = value
 		}
@@ -195,7 +261,7 @@ func codexEnv(home string, extra map[string]string) []string {
 		}
 	}
 	env["HOME"] = home
-	env["CODEX_HOME"] = filepath.Join(home, ".codex")
+	env["CODEX_HOME"] = codexHome
 	env["XDG_CONFIG_HOME"] = filepath.Join(home, ".config")
 	env["XDG_CACHE_HOME"] = filepath.Join(home, ".cache")
 	var out []string
@@ -252,7 +318,7 @@ func (p *codexParser) feed(line []byte) {
 		}
 		p.started = true
 	case "item.completed":
-		if p.res.SawInit && p.started && !p.res.SawResult && ev.Item.Type == "command_execution" && ev.Item.Status == "completed" && ev.Item.ExitCode != nil && *ev.Item.ExitCode == 0 && p.skill != "" && strings.Contains(ev.Item.Output, p.skill) {
+		if p.res.SawInit && p.started && !p.res.SawResult && ev.Item.Type == "command_execution" && ev.Item.Status == "completed" && ev.Item.ExitCode != nil && *ev.Item.ExitCode == 0 && p.skill != "" && strings.Contains(strings.ReplaceAll(ev.Item.Output, "\r\n", "\n"), strings.ReplaceAll(p.skill, "\r\n", "\n")) {
 			p.res.SkillLoaded = true
 		}
 	case "turn.completed":

@@ -111,9 +111,9 @@ type Verdict struct {
 	// fails, but the failure must not be reported as a skill failure.
 	NonSkillAttributable bool `json:"non_skill_attributable,omitempty"`
 	// CostUSD sums reported cost across attempts. Null means at least one
-	// attempt did not report cost; Codex must never be presented as free.
+	// agent invocation did not report cost; setup failures cost nothing.
 	CostUSD *float64 `json:"cost_usd"`
-	// Usage sums token counts only when every attempt reported them.
+	// Usage sums token counts only when every agent invocation reported them.
 	Usage *TokenUsage `json:"usage,omitempty"`
 	// Evidence points at transcripts and telemetry files.
 	Evidence Evidence `json:"evidence"`

@@ -106,6 +106,29 @@ func TestRunnerUnknownCostRemainsUnknownAcrossRetries(t *testing.T) {
 	}
 }
 
+func TestVerdictSetupFailuresDoNotEraseKnownUsage(t *testing.T) {
+	for _, setupFirst := range []bool{true, false} {
+		t.Run(fmt.Sprint(setupFirst), func(t *testing.T) {
+			v := Verdict{CostUSD: new(float64), Usage: &TokenUsage{}}
+			setupFailure := attemptOutcome{class: ClassInfra, detail: "fixture copy failed"}
+			run := attemptOutcome{agentInvoked: true, cost: 0.05, agent: &AgentResult{CostKnown: true, Usage: &TokenUsage{InputTokens: 120}}}
+			outcomes := []attemptOutcome{setupFailure, run}
+			if !setupFirst {
+				outcomes = []attemptOutcome{run, setupFailure}
+			}
+			for _, out := range outcomes {
+				v.addAgentUsage(out)
+			}
+			require.NotNil(t, v.CostUSD)
+			require.InDelta(t, 0.05, *v.CostUSD, 1e-9)
+			require.Equal(t, &TokenUsage{InputTokens: 120}, v.Usage)
+			v.addAgentUsage(attemptOutcome{agentInvoked: true})
+			require.Nil(t, v.CostUSD, "an invoked agent with missing data remains unknown")
+			require.Nil(t, v.Usage)
+		})
+	}
+}
+
 // Covers AE1: an attempt that fails agent-attributably and then succeeds
 // yields a passing verdict that records the flake. Both attempts load the
 // skill (their init events expose the command); the first attempt's span

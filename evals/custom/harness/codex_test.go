@@ -43,6 +43,7 @@ func TestCodexParserRequiresSkillContentFromSuccessfulTool(t *testing.T) {
 		loaded     bool
 	}{
 		{"complete skill", codexRead(codexSkillText+"\n", "completed", 0), true},
+		{"PTY line endings", codexRead(strings.ReplaceAll(codexSkillText, "\n", "\r\n"), "completed", 0), true},
 		{"path only", codexRead("/tmp/.agents/skills/otel-ottl/SKILL.md", "completed", 0), false},
 		{"partial read", codexRead("Read the rules.", "completed", 0), false},
 		{"wrong skill", codexRead(strings.ReplaceAll(codexSkillText, "otel-ottl", "otel-collector"), "completed", 0), false},
@@ -135,6 +136,7 @@ func TestCodexInvokeIsolatesConfigAndCapturesEvidence(t *testing.T) {
 	args, err := os.ReadFile(filepath.Join(capture, "args"))
 	require.NoError(t, err)
 	require.Contains(t, string(args), "exec\n--json\n--ephemeral\n--ignore-user-config\n")
+	require.Contains(t, string(args), "--ignore-rules\n")
 	require.Contains(t, string(args), "--sandbox\nworkspace-write\n")
 	require.Contains(t, string(args), "--model\nTEST-model\n")
 	require.NotContains(t, string(args), "--max-turns")
@@ -162,17 +164,23 @@ func TestCodexInvokeIsolatesConfigAndCapturesEvidence(t *testing.T) {
 	require.Contains(t, string(transcript), codexCompleted)
 }
 
-func TestCodexInvokeSavedAuthIsTemporaryAndLocalOnly(t *testing.T) {
+func TestCodexInvokeDedicatedAuthPersistsRefreshAndIsLocalOnly(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("GITHUB_ACTIONS", "")
 	t.Setenv("CODEX_API_KEY", "TEST-must-not-override-subscription")
+	personal := t.TempDir()
+	t.Setenv("CODEX_HOME", personal)
+	original := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"TEST-personal-access"}}`)
+	require.NoError(t, os.WriteFile(filepath.Join(personal, "auth.json"), original, 0o600))
 	capture := filepath.Join(t.TempDir(), "home")
 	body := fmt.Sprintf("printf '%%s' \"$HOME\" > %s\ntest -z \"$CODEX_API_KEY\" || exit 9\ntest -f \"$CODEX_HOME/auth.json\" || exit 8\n", shellQuote(capture))
+	refreshed := `{"auth_mode":"chatgpt","tokens":{"access_token":"TEST-new-access","refresh_token":"TEST-new-refresh"}}`
+	body += "printf '%s' " + shellQuote(refreshed) + " > \"$CODEX_HOME/auth.json.new\"\nmv \"$CODEX_HOME/auth.json.new\" \"$CODEX_HOME/auth.json\"\n"
 	body += testutil.CatBody(codexStarted, codexTurn, codexRead(codexSkillText, "completed", 0), codexCompleted)
 	a, inv := codexTestAgent(t, codexStub(t, body))
-	a.AuthFile = filepath.Join(t.TempDir(), "auth.json")
+	a.AuthHome = t.TempDir()
 	auth := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"TEST-access-token"}}`)
-	require.NoError(t, os.WriteFile(a.AuthFile, auth, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(a.AuthHome, "auth.json"), auth, 0o600))
 	r, err := a.Invoke(context.Background(), inv)
 	require.NoError(t, err)
 	class, detail := classifyAgentRun(r)
@@ -180,12 +188,44 @@ func TestCodexInvokeSavedAuthIsTemporaryAndLocalOnly(t *testing.T) {
 	home, err := os.ReadFile(capture)
 	require.NoError(t, err)
 	require.NoDirExists(t, string(home))
-	original, err := os.ReadFile(a.AuthFile)
+	saved, err := os.ReadFile(filepath.Join(a.AuthHome, "auth.json"))
 	require.NoError(t, err)
-	require.Equal(t, auth, original, "original login must not be modified")
+	require.Equal(t, refreshed, string(saved), "rotated evaluation tokens must survive cleanup")
+	unchanged, err := os.ReadFile(filepath.Join(personal, "auth.json"))
+	require.NoError(t, err)
+	require.Equal(t, original, unchanged, "personal login must not be modified")
+	// A second invocation reads the new file, rather than a stale snapshot.
+	a.Binary = codexStub(t, "test \"$(cat \"$CODEX_HOME/auth.json\")\" = "+shellQuote(refreshed)+" || exit 9\n"+testutil.CatBody(codexStarted, codexTurn, codexRead(codexSkillText, "completed", 0), codexCompleted))
+	r, err = a.Invoke(context.Background(), inv)
+	require.NoError(t, err)
+	class, detail = classifyAgentRun(r)
+	require.Equal(t, ClassNone, class, detail)
 	t.Setenv("CI", "true")
 	_, err = a.Invoke(context.Background(), inv)
 	require.ErrorContains(t, err, "local-only")
+}
+
+func TestCodexInvokeRetainsErrorOnNonzeroExit(t *testing.T) {
+	a, inv := codexTestAgent(t, codexStub(t, testutil.CatBody(codexStarted, codexTurn, `{"type":"error","message":"TEST-authentication unavailable"}`)+"exit 1\n"))
+	r, err := a.Invoke(context.Background(), inv)
+	require.NoError(t, err)
+	class, detail := classifyAgentRun(r)
+	require.Equal(t, ClassInfra, class)
+	require.Contains(t, detail, "TEST-authentication unavailable")
+}
+
+func TestCodexEnvPreservesProxyAndCertificates(t *testing.T) {
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE"} {
+		t.Setenv(key, "TEST-"+key)
+	}
+	t.Setenv("OPENAI_BASE_URL", "TEST-provider-override")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "TEST-secret")
+	env := strings.Join(codexEnv("TEST-home", "TEST-codex-home", nil), "\n")
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE"} {
+		require.Contains(t, env, key+"=TEST-"+key)
+	}
+	require.NotContains(t, env, "TEST-provider-override")
+	require.NotContains(t, env, "TEST-secret")
 }
 
 func TestCodexInvokeRejectsCLIAndStreamFailures(t *testing.T) {
@@ -283,23 +323,66 @@ func TestCodexOutputChunkingAndLimits(t *testing.T) {
 	require.ErrorContains(t, err, "exceeds 16 MiB")
 }
 
-func TestCopyCodexAuthRejectsOtherCredentialsWithoutLeakingThem(t *testing.T) {
-	src := filepath.Join(t.TempDir(), "auth.json")
-	dst := filepath.Join(t.TempDir(), "auth.json")
+func TestCodexAuthRejectsOtherCredentialsAndPersonalHomes(t *testing.T) {
+	home := t.TempDir()
+	src := filepath.Join(home, "auth.json")
 	for _, data := range []string{
 		`{"auth_mode":"apikey","OPENAI_API_KEY":"TEST-secret"}`,
 		`{"auth_mode":"chatgpt","tokens":{}}`,
 		`invalid TEST-secret`,
 	} {
 		require.NoError(t, os.WriteFile(src, []byte(data), 0o600))
-		err := copyCodexAuth(src, dst)
+		_, err := validateCodexAuthHome(home)
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), "TEST-secret")
-		require.NoFileExists(t, dst)
 	}
 	require.NoError(t, os.WriteFile(src, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"TEST-secret"}}`), 0o600))
-	require.NoError(t, copyCodexAuth(src, dst))
-	info, err := os.Stat(dst)
+	_, err := validateCodexAuthHome(home)
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	t.Setenv("CODEX_HOME", home)
+	_, err = validateCodexAuthHome(home)
+	require.ErrorContains(t, err, "separate from your personal")
+	alias := filepath.Join(t.TempDir(), "alias")
+	require.NoError(t, os.Symlink(home, alias))
+	_, err = validateCodexAuthHome(alias)
+	require.ErrorContains(t, err, "separate from your personal")
+	_, err = validateCodexAuthHome("relative-home")
+	require.ErrorContains(t, err, "absolute path")
+}
+
+func TestCodexAuthRejectsPersonalFilesystemAliases(t *testing.T) {
+	personal := filepath.Join(t.TempDir(), "codexhome")
+	require.NoError(t, os.Mkdir(personal, 0o700))
+	auth := filepath.Join(personal, "auth.json")
+	require.NoError(t, os.WriteFile(auth, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"TEST-secret"}}`), 0o600))
+	t.Setenv("CODEX_HOME", personal)
+	t.Run("hard-linked login", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Link(auth, filepath.Join(home, "auth.json")))
+		_, err := validateCodexAuthHome(home)
+		require.ErrorContains(t, err, "must not alias your personal login")
+	})
+	t.Run("case-insensitive directory", func(t *testing.T) {
+		alias := filepath.Join(filepath.Dir(personal), "CODEXHOME")
+		if _, err := os.Stat(alias); err != nil {
+			t.Skip("filesystem is case-sensitive")
+		}
+		_, err := validateCodexAuthHome(alias)
+		require.ErrorContains(t, err, "separate from your personal")
+	})
+}
+
+func TestCodexAuthRejectsPersistentInstructions(t *testing.T) {
+	for _, name := range []string{"AGENTS.md", "AGENTS.override.md", "rules", "memories", "memory_summary.md", "skills/custom-skill"} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"TEST-token"}}`), 0o600))
+			require.NoError(t, os.MkdirAll(filepath.Join(home, "skills", ".system"), 0o700))
+			_, err := validateCodexAuthHome(home)
+			require.NoError(t, err, "CLI-installed system skills are permitted")
+			require.NoError(t, os.WriteFile(filepath.Join(home, name), []byte("TEST-personal-instructions"), 0o600))
+			_, err = validateCodexAuthHome(home)
+			require.ErrorContains(t, err, "dedicated login")
+		})
+	}
 }

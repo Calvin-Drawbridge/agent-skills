@@ -25,6 +25,10 @@ const telemetryPollInterval = 100 * time.Millisecond
 // wedged cluster cannot hang the run after a telemetry stall.
 const diagnoseTimeout = 90 * time.Second
 
+// Leave time for CLI shutdown and evidence cleanup before testing's hard
+// timeout panics, which would skip invocation defers entirely.
+const testCleanupReserve = 5 * time.Second
+
 // FixtureHooks are the pluggable per-fixture build and run steps. Actual
 // fixtures (and their hooks) arrive with U3; the harness only defines the
 // contract. Both hooks receive the fixture workspace (the temp copy the agent
@@ -93,6 +97,7 @@ type attemptOutcome struct {
 	class          FailureClass
 	detail         string
 	cost           float64
+	agentInvoked   bool
 	agent          *AgentResult
 	transcriptPath string
 	telemetryPaths []string
@@ -110,26 +115,20 @@ func (r *Runner) Run(t *testing.T, sc Scenario) Verdict {
 	t.Helper()
 
 	v := Verdict{ScenarioID: sc.ID, CostUSD: new(float64), Usage: &TokenUsage{}}
+	runCtx := context.Background()
+	if deadline, ok := t.Deadline(); ok {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithDeadline(runCtx, deadline.Add(-testCleanupReserve))
+		defer cancel()
+	}
 	runDir := t.TempDir()
 	infraFailures := 0
 	agentAttempts := 0
 	var firstAgentClass FailureClass
 
 	for attempt := 1; ; attempt++ {
-		out := r.attempt(t, sc, filepath.Join(runDir, fmt.Sprintf("attempt-%d", attempt)))
-		if out.agent == nil || !out.agent.CostKnown {
-			v.CostUSD = nil
-		} else if v.CostUSD != nil {
-			*v.CostUSD += out.cost
-		}
-		if out.agent == nil || out.agent.Usage == nil {
-			v.Usage = nil
-		} else if v.Usage != nil {
-			v.Usage.InputTokens += out.agent.Usage.InputTokens
-			v.Usage.CachedInputTokens += out.agent.Usage.CachedInputTokens
-			v.Usage.OutputTokens += out.agent.Usage.OutputTokens
-			v.Usage.ReasoningOutputTokens += out.agent.Usage.ReasoningOutputTokens
-		}
+		out := r.attempt(runCtx, t, sc, filepath.Join(runDir, fmt.Sprintf("attempt-%d", attempt)))
+		v.addAgentUsage(out)
 		if out.agent != nil {
 			v.AgentBackend, v.Model, v.CLIVersion = out.agent.Backend, out.agent.Model, out.agent.CLIVersion
 			v.ReasoningEffort = out.agent.ReasoningEffort
@@ -139,6 +138,12 @@ func (r *Runner) Run(t *testing.T, sc Scenario) Verdict {
 		}
 		if len(out.telemetryPaths) > 0 {
 			v.Evidence.TelemetryPaths = out.telemetryPaths
+		}
+		if runCtx.Err() != nil && out.class != ClassNone {
+			v.Class = ClassInfraFail
+			v.NonSkillAttributable = true
+			v.Detail = "stopped before the Go test deadline to allow agent and evidence cleanup; increase -timeout"
+			return v
 		}
 
 		if out.class == ClassInfra {
@@ -176,10 +181,34 @@ func (r *Runner) Run(t *testing.T, sc Scenario) Verdict {
 	}
 }
 
+func (v *Verdict) addAgentUsage(out attemptOutcome) {
+	// Setup failures cannot have consumed model quota. They must not erase
+	// known usage from invocations before or after an infrastructure retry.
+	if !out.agentInvoked {
+		return
+	}
+	if out.agent == nil || !out.agent.CostKnown {
+		v.CostUSD = nil
+	} else if v.CostUSD != nil {
+		*v.CostUSD += out.cost
+	}
+	if out.agent == nil || out.agent.Usage == nil {
+		v.Usage = nil
+	} else if v.Usage != nil {
+		v.Usage.InputTokens += out.agent.Usage.InputTokens
+		v.Usage.CachedInputTokens += out.agent.Usage.CachedInputTokens
+		v.Usage.OutputTokens += out.agent.Usage.OutputTokens
+		v.Usage.ReasoningOutputTokens += out.agent.Usage.ReasoningOutputTokens
+	}
+}
+
 // attempt runs the scenario once: fixture copy, sink, relay, agent, fixture
 // hooks, telemetry wait, assertions.
-func (r *Runner) attempt(t *testing.T, sc Scenario, attemptDir string) attemptOutcome {
+func (r *Runner) attempt(parent context.Context, t *testing.T, sc Scenario, attemptDir string) attemptOutcome {
 	t.Helper()
+	if err := parent.Err(); err != nil {
+		return attemptOutcome{class: ClassInfra, detail: err.Error()}
+	}
 
 	if err := os.MkdirAll(attemptDir, 0o755); err != nil {
 		return attemptOutcome{class: ClassInfra, detail: fmt.Sprintf("create attempt dir: %v", err)}
@@ -189,7 +218,7 @@ func (r *Runner) attempt(t *testing.T, sc Scenario, attemptDir string) attemptOu
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	// Prepare the fixture workspace copy the agent may modify.
@@ -234,6 +263,7 @@ func (r *Runner) attempt(t *testing.T, sc Scenario, attemptDir string) attemptOu
 			class:          class,
 			detail:         detail,
 			cost:           cost,
+			agentInvoked:   true,
 			agent:          res,
 			transcriptPath: transcript,
 			telemetryPaths: telemetryFiles(sink.Dir()),
@@ -292,11 +322,11 @@ func (r *Runner) attempt(t *testing.T, sc Scenario, attemptDir string) attemptOu
 		// the fixture dump the delivery-path infrastructure. Together they say
 		// both "which telemetry arrived and what shape" and "why".
 		summarizeSink(t, sink)
-		if r.Hooks.Diagnose != nil {
+		if r.Hooks.Diagnose != nil && parent.Err() == nil {
 			// Best-effort infra dump while the fixture is still up. Run on a
 			// fresh bounded context so it works even when the scenario ctx is
 			// at its deadline (the common trigger for a telemetry stall).
-			dctx, cancel := context.WithTimeout(context.Background(), diagnoseTimeout)
+			dctx, cancel := context.WithTimeout(parent, diagnoseTimeout)
 			r.Hooks.Diagnose(dctx, class, detail)
 			cancel()
 		}

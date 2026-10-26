@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -38,18 +37,15 @@ func AgentFromEnv(root string, versions *Versions) (AgentInvoker, error) {
 			if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
 				return nil, fmt.Errorf("EVAL_CODEX_AUTH=chatgpt is local-only; use API authentication on a trusted CI runner")
 			}
-			home := os.Getenv("CODEX_HOME")
+			home := os.Getenv("EVAL_CODEX_AUTH_HOME")
 			if home == "" {
-				userHome, err := os.UserHomeDir()
-				if err != nil {
-					return nil, fmt.Errorf("locate Codex login: %w", err)
-				}
-				home = filepath.Join(userHome, ".codex")
+				return nil, fmt.Errorf("EVAL_CODEX_AUTH=chatgpt requires EVAL_CODEX_AUTH_HOME with a dedicated evaluation login (do not copy your personal auth.json)")
 			}
-			a.AuthFile = filepath.Join(home, "auth.json")
-			if _, err := os.Stat(a.AuthFile); err != nil {
-				return nil, fmt.Errorf("%w: local Codex auth.json unavailable; run codex login first", ErrAgentCredentialsUnavailable)
+			validated, err := validateCodexAuthHome(home)
+			if err != nil {
+				return nil, err
 			}
+			a.AuthHome = validated
 		default:
 			return nil, fmt.Errorf("unknown EVAL_CODEX_AUTH %q (use api or chatgpt)", auth)
 		}

@@ -53,43 +53,66 @@ The adapter requires CLI version `0.162.1`, pinned by `CodexCLIVersion` in [`har
 Set `EVAL_CODEX_MODEL` explicitly to the model ID you intend to evaluate; the adapter does not reuse Claude’s `EVAL_MODEL` or your personal Codex model settings.
 Reasoning effort is fixed to `medium`, and verdicts record the backend, CLI version, model, and effort.
 
-For a local ChatGPT subscription run, first sign in with `codex login`, then run from `evals/custom/`:
+For local ChatGPT subscription runs, create a dedicated evaluation login once.
+Use a new, private directory, separate from your normal `CODEX_HOME`; do not copy an existing `auth.json`, because refresh tokens rotate.
+
+```bash
+export EVAL_CODEX_AUTH_HOME="$HOME/.codex-skill-evals"
+mkdir -p "$EVAL_CODEX_AUTH_HOME"
+chmod 700 "$EVAL_CODEX_AUTH_HOME"
+CODEX_HOME="$EVAL_CODEX_AUTH_HOME" codex -c 'cli_auth_credentials_store="file"' login
+```
+
+Keep `EVAL_CODEX_AUTH_HOME` set, and run from `evals/custom/`:
 
 ```bash
 EVAL_AGENT=codex EVAL_CODEX_AUTH=chatgpt \
   EVAL_CODEX_MODEL="${EVAL_CODEX_MODEL:?Set the model ID to evaluate}" \
   EVAL_SCENARIOS=collector-pipeline-hardening,ottl-redaction \
   EVAL_VERDICT_DIR=/tmp/codex-eval-evidence \
-  go test ./scenarios -run TestScenarios -count=1 -v -timeout 30m
+  go test ./scenarios -run TestScenarios -count=1 -v -timeout 4h
 ```
 
 Subscription authentication is explicitly opt-in and rejected when `CI` or `GITHUB_ACTIONS` is set.
-It copies only the existing `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) into a temporary directory with private permissions; personal config, plugins, MCP servers, and skills are not copied.
-The temporary login is removed after each invocation, and the original login file is not modified.
-File-based ChatGPT login is required; keychain-only credentials are not imported.
+The CLI uses `EVAL_CODEX_AUTH_HOME` as persistent authentication storage, so refreshed evaluation tokens survive subsequent attempts.
+The harness rejects the normal personal `CODEX_HOME` and `~/.codex` paths, including symlink aliases, and does not read or modify the personal login.
+
+File-based ChatGPT login is required; keychain-only credentials are not imported, and CI must use API authentication.
+Keep this directory dedicated to evaluations; the adapter ignores `config.toml` and rules, rejects global instructions, memories, and custom skills, and uses a separate temporary `HOME` containing the repository skills.
+Invalid evaluation homes fail before scenario infrastructure starts.
 
 For API authentication, provide `CODEX_API_KEY` in the invoking process’s environment and select `EVAL_CODEX_AUTH=api` (the default for Codex).
 The adapter never silently falls back from API authentication to subscription quota, or from Codex to Claude.
 `EVAL_AGENT_BINARY` overrides the selected CLI path; it does not select the backend.
 
-Codex uses [`codex exec --json`](https://developers.openai.com/codex/noninteractive) with a temporary `HOME`, `CODEX_HOME`, and XDG configuration/cache directories, a restricted inherited environment, and the `workspace-write` sandbox with command networking enabled for build tools.
+Codex uses [`codex exec --json`](https://developers.openai.com/codex/noninteractive) with a temporary `HOME` and XDG configuration/cache directories, a restricted inherited environment, and the `workspace-write` sandbox with command networking enabled for build tools.
+`CODEX_HOME` is also temporary for API authentication; subscription mode uses the dedicated persistent evaluation login.
+Proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, and their lowercase forms) and certificate settings (`SSL_CERT_FILE`, `SSL_CERT_DIR`, and `CODEX_CA_CERTIFICATE`) are retained for networks that require them.
+
 The prompt explicitly selects the skill and requests a full `SKILL.md` read; the adapter requires the original contents in a successful command result before the fixture can pass.
 A path mention or an assistant’s claim that it used the skill is insufficient evidence.
 This confirms the skill entered context; it does not establish the skill’s incremental benefit without a separate skill-off control.
 
 Codex has no equivalent of Claude’s `--max-turns`: scenario `Timeout` bounds its invocation, and `MaxTurns` applies only to Claude.
-On Unix, cancellation kills the CLI’s process group, including child commands; on other systems, it kills the CLI and bounds output-pipe cleanup, without guaranteeing descendant cleanup.
+On Unix, cancellation first sends `SIGTERM` to the CLI’s process group, allowing Codex to shut down its own helpers, then escalates after 2 seconds and kills remaining group members.
+Unix interruption signals cancel the invocation, clean up, and terminate the test process without retrying; inherited ignored signals remain ignored for `nohup` and background jobs.
+The runner stops 5 seconds before Go’s outer test deadline to leave time for cleanup; an exhausted outer budget is infrastructure failure, not a skill failure.
+
+The example allows 4 hours for 2 scenarios with up to 4 attempts each at 25 minutes per attempt; choose an outer timeout that covers the selected scenarios and retry budget.
+Helpers that detach and ignore graceful shutdown are not guaranteed to stop; neither cleanup after `SIGKILL` or a host crash nor descendant cleanup on non-Unix systems is guaranteed.
 Malformed or incomplete JSON, missing skill evidence, terminal API failures, and unsuccessful CLI exits cannot produce a passing verdict.
 Recoverable stream errors followed by successful completion do not consume an infrastructure retry.
 
 Codex reports token usage, but not a dollar cost.
-`cost_usd` is therefore `null`, never a fabricated `0`; it is also `null` when any attempt lacks cost data.
-The optional `usage` field sums reported tokens only when every attempt reported them, and cached input tokens are already included in input tokens.
+`cost_usd` is therefore `null`, never a fabricated `0`; it is also `null` when any agent invocation lacks cost data.
+Setup failures before invoking the agent do not consume model quota or erase known totals.
+The optional `usage` field sums reported tokens only when every agent invocation reported them, and cached input tokens are already included in input tokens.
 Raw per-attempt transcripts retain available usage when the aggregate is incomplete.
 
 The existing GitHub workflows continue to use Claude; this backend does not add paid CI jobs, secrets, or a cross-agent matrix.
 Enable credentialed Codex CI only through a separate maintainer-approved change on trusted runners with explicit model, spending, and isolation policies.
 Temporary configuration isolation is not a host security boundary: managed/admin settings and bundled system skills can still apply, and fixture code must remain trusted.
+Proxy URLs can contain credentials and are available to build commands; avoid printing the environment, and treat transcripts as sensitive local evidence before sharing them.
 
 ## Running example validation
 

@@ -239,7 +239,7 @@ func classifyAgentRun(res *AgentResult) (FailureClass, string) {
 	case res.ProtocolError != "":
 		return ClassInfra, "invalid CLI event stream: " + res.ProtocolError
 	case res.ExitErr != nil && !res.SawResult:
-		return ClassInfra, fmt.Sprintf("CLI exited without a result event: %v", res.ExitErr)
+		return ClassInfra, appendResultText(fmt.Sprintf("CLI exited without a result event: %v", res.ExitErr), res.ResultText)
 	case !res.SawResult:
 		return ClassInfra, appendResultText("CLI stream ended without a result event", res.ResultText)
 	case res.IsError:
